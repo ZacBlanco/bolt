@@ -31,7 +31,22 @@
 #pragma once
 #include <string>
 namespace bytedance::bolt::functions::prestosql {
-void registerArithmeticFunctions(const std::string& prefix = "");
+
+void registerBasicArithmeticFunctions(const std::string& prefix = "");
+
+void registerTrigonometricFunctions(const std::string& prefix = "");
+
+void registerRoundingFunctions(const std::string& prefix = "");
+
+void registerExponentialLogarithmicFunctions(const std::string& prefix = "");
+
+void registerProbabilityFunctions(const std::string& prefix = "");
+
+void registerRandomFunctions(const std::string& prefix = "");
+
+void registerDecimalArithmeticFunctions(const std::string& prefix = "");
+
+void registerMiscArithmeticFunctions(const std::string& prefix = "");
 
 void registerCheckedArithmeticFunctions(const std::string& prefix = "");
 
