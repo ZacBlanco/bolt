@@ -64,7 +64,15 @@ void registerHyperLogFunctions(const std::string& prefix = "");
 
 void registerGeneralFunctions(const std::string& prefix = "");
 
-void registerDateTimeFunctions(const std::string& prefix = "");
+void registerDateTimeArithmeticFunctions(const std::string& prefix = "");
+
+void registerDateTimeBasicConversionFunctions(const std::string& prefix = "");
+
+void registerDateTimeDateComponentExtractionFunctions(
+    const std::string& prefix = "");
+
+void registerDateTimeTimeComponentExtractionFunctions(
+    const std::string& prefix = "");
 
 void registerURLFunctions(const std::string& prefix = "");
 

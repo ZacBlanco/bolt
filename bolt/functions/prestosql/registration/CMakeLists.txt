@@ -44,6 +44,10 @@ add_library(
   CheckedArithmeticRegistration.cpp
   ComparisonFunctionsRegistration.cpp
   DateTimeFunctionsRegistration.cpp
+  DateTimeFunctionsArithmeticRegistration.cpp
+  DateTimeFunctionsBasicConversionRegistration.cpp
+  DateTimeFunctionsDateComponentExtractionRegistration.cpp
+  DateTimeFunctionsTimeComponentExtractionRegistration.cpp
   GeneralFunctionsRegistration.cpp
   HyperLogFunctionsRegistration.cpp
   JsonFunctionsRegistration.cpp

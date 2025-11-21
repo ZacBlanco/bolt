@@ -29,7 +29,12 @@ extern void registerArrayFunctions(const std::string& prefix);
 extern void registerBitwiseFunctions(const std::string& prefix);
 extern void registerCheckedArithmeticFunctions(const std::string& prefix);
 extern void registerComparisonFunctions(const std::string& prefix);
-extern void registerDateTimeFunctions(const std::string& prefix);
+extern void registerDateTimeArithmeticFunctions(const std::string& prefix);
+extern void registerDateTimeBasicConversionFunctions(const std::string& prefix);
+extern void registerDateTimeDateComponentExtractionFunctions(
+    const std::string& prefix);
+extern void registerDateTimeTimeComponentExtractionFunctions(
+    const std::string& prefix);
 extern void registerGeneralFunctions(const std::string& prefix);
 extern void registerHyperLogFunctions(const std::string& prefix);
 extern void registerJsonFunctions(const std::string& prefix);
@@ -105,8 +110,22 @@ void registerGeneralFunctions(const std::string& prefix) {
   functions::registerGeneralFunctions(prefix);
 }
 
-void registerDateTimeFunctions(const std::string& prefix) {
-  functions::registerDateTimeFunctions(prefix);
+void registerDateTimeArithmeticFunctions(const std::string& prefix) {
+  functions::registerDateTimeArithmeticFunctions(prefix);
+}
+
+void registerDateTimeBasicConversionFunctions(const std::string& prefix) {
+  functions::registerDateTimeBasicConversionFunctions(prefix);
+}
+
+void registerDateTimeDateComponentExtractionFunctions(
+    const std::string& prefix) {
+  functions::registerDateTimeDateComponentExtractionFunctions(prefix);
+}
+
+void registerDateTimeTimeComponentExtractionFunctions(
+    const std::string& prefix) {
+  functions::registerDateTimeTimeComponentExtractionFunctions(prefix);
 }
 
 void registerURLFunctions(const std::string& prefix) {
@@ -145,7 +164,10 @@ void registerAllScalarFunctions(const std::string& prefix) {
   registerJsonFunctions(prefix);
   registerHyperLogFunctions(prefix);
   registerGeneralFunctions(prefix);
-  registerDateTimeFunctions(prefix);
+  registerDateTimeArithmeticFunctions(prefix);
+  registerDateTimeBasicConversionFunctions(prefix);
+  registerDateTimeDateComponentExtractionFunctions(prefix);
+  registerDateTimeTimeComponentExtractionFunctions(prefix);
   registerURLFunctions(prefix);
   registerStringFunctions(prefix);
   registerBinaryFunctions(prefix);
