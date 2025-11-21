@@ -38,7 +38,11 @@ add_library(
   RegisterDatetime.cpp
   RegisterJson.cpp
   RegisterMap.cpp
-  RegisterMath.cpp
+  RegisterMathArithmetic.cpp
+  RegisterMathDecimal.cpp
+  RegisterMathMisc.cpp
+  RegisterMathRandom.cpp
+  RegisterMathTrigonometric.cpp
   RegisterMisc.cpp
   RegisterRegexp.cpp
   RegisterSpecialForm.cpp
