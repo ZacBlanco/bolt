@@ -17,14 +17,7 @@
 #include <string>
 namespace bytedance::bolt::functions {
 
-extern void registerBasicArithmeticFunctions(const std::string& prefix);
-extern void registerTrigonometricFunctions(const std::string& prefix);
-extern void registerRoundingFunctions(const std::string& prefix);
-extern void registerExponentialLogarithmicFunctions(const std::string& prefix);
-extern void registerProbabilityFunctions(const std::string& prefix);
-extern void registerRandomFunctions(const std::string& prefix);
-extern void registerDecimalArithmeticFunctions(const std::string& prefix);
-extern void registerMiscArithmeticFunctions(const std::string& prefix);
+extern void registerArithmeticFunctions(const std::string& prefix);
 extern void registerArrayFunctions(const std::string& prefix);
 extern void registerBitwiseFunctions(const std::string& prefix);
 extern void registerCheckedArithmeticFunctions(const std::string& prefix);
@@ -49,37 +42,8 @@ extern void registerMapAllowingDuplicates(
 extern void registerInternalArrayFunctions();
 
 namespace prestosql {
-
-void registerBasicArithmeticFunctions(const std::string& prefix) {
-  functions::registerBasicArithmeticFunctions(prefix);
-}
-
-void registerTrigonometricFunctions(const std::string& prefix) {
-  functions::registerTrigonometricFunctions(prefix);
-}
-
-void registerRoundingFunctions(const std::string& prefix) {
-  functions::registerRoundingFunctions(prefix);
-}
-
-void registerExponentialLogarithmicFunctions(const std::string& prefix) {
-  functions::registerExponentialLogarithmicFunctions(prefix);
-}
-
-void registerProbabilityFunctions(const std::string& prefix) {
-  functions::registerProbabilityFunctions(prefix);
-}
-
-void registerRandomFunctions(const std::string& prefix) {
-  functions::registerRandomFunctions(prefix);
-}
-
-void registerDecimalArithmeticFunctions(const std::string& prefix) {
-  functions::registerDecimalArithmeticFunctions(prefix);
-}
-
-void registerMiscArithmeticFunctions(const std::string& prefix) {
-  functions::registerMiscArithmeticFunctions(prefix);
+void registerArithmeticFunctions(const std::string& prefix) {
+  functions::registerArithmeticFunctions(prefix);
 }
 
 void registerCheckedArithmeticFunctions(const std::string& prefix) {
@@ -149,14 +113,7 @@ void registerAllMetricsFunctions(const std::string& prefix) {
 }
 
 void registerAllScalarFunctions(const std::string& prefix) {
-  registerBasicArithmeticFunctions(prefix);
-  registerTrigonometricFunctions(prefix);
-  registerRoundingFunctions(prefix);
-  registerExponentialLogarithmicFunctions(prefix);
-  registerProbabilityFunctions(prefix);
-  registerRandomFunctions(prefix);
-  registerDecimalArithmeticFunctions(prefix);
-  registerMiscArithmeticFunctions(prefix);
+  registerArithmeticFunctions(prefix);
   registerCheckedArithmeticFunctions(prefix);
   registerComparisonFunctions(prefix);
   registerMapFunctions(prefix);

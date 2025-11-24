@@ -31,14 +31,15 @@ find_package(sonic-cpp CONFIG REQUIRED)
 
 add_library(
   bolt_functions_prestosql
-  BasicArithmeticFunctionsRegistration.cpp
-  TrigonometricFunctionsRegistration.cpp
-  RoundingFunctionsRegistration.cpp
-  ExponentialLogarithmicFunctionsRegistration.cpp
-  ProbabilityFunctionsRegistration.cpp
-  RandomFunctionsRegistration.cpp
-  DecimalArithmeticFunctionsRegistration.cpp
-  MiscArithmeticFunctionsRegistration.cpp
+  ArithmeticFunctionsRegistration.cpp
+  ArithmeticBasicFunctionsRegistration.cpp
+  ArithmeticExponentialFunctionsRegistration.cpp
+  ArithmeticProbabilityFunctionsRegistration.cpp
+  ArithmeticRandomFunctionsRegistration.cpp
+  ArithmeticDecimalFunctionsRegistration.cpp
+  ArithmeticMiscFunctionsRegistration.cpp
+  ArithmeticTrigonometricFunctionsRegistration.cpp
+  ArithmeticRoundingFunctionsRegistration.cpp
   ArrayFunctionsRegistration.cpp
   BinaryFunctionsRegistration.cpp
   CheckedArithmeticRegistration.cpp
