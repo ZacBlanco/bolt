@@ -16,8 +16,7 @@
 #include "velox/functions/lib/RegistrationHelpers.h"
 #include "velox/functions/sparksql/Rand.h"
 
-namespace bytedance::bolt::functions {
-namespace sparksql {
+namespace bytedance::bolt::functions::sparksql {
 
 void registerMathRandomFunctions(const std::string& prefix) {
   registerFunction<RandFunction, double>({prefix + "rand", prefix + "random"});
@@ -26,6 +25,4 @@ void registerMathRandomFunctions(const std::string& prefix) {
   registerFunction<RandFunction, double, Constant<int64_t>>(
       {prefix + "rand", prefix + "random"});
 }
-
-} // namespace sparksql
-} // namespace bytedance::bolt::functions
+} // namespace bytedance::bolt::functions::sparksql

@@ -47,6 +47,5 @@ void registerMathDecimalFunctions(const std::string& prefix) {
   BOLT_REGISTER_VECTOR_FUNCTION(udf_decimal_ceil, prefix + "ceil");
   BOLT_REGISTER_VECTOR_FUNCTION(udf_decimal_floor, prefix + "floor");
 }
-
 } // namespace sparksql
 } // namespace bytedance::bolt::functions

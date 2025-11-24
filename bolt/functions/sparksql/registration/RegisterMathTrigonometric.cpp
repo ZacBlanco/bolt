@@ -18,8 +18,7 @@
 #include "velox/functions/prestosql/Arithmetic.h"
 #include "velox/functions/sparksql/Arithmetic.h"
 
-namespace bytedance::bolt::functions {
-namespace sparksql {
+namespace bytedance::bolt::functions::sparksql {
 
 void registerMathTrigonometricFunctions(const std::string& prefix) {
   registerFunction<AcosFunction, double, double>({prefix + "acos"});
@@ -36,6 +35,4 @@ void registerMathTrigonometricFunctions(const std::string& prefix) {
   registerFunction<sparksql::Atan2Function, double, double, double>(
       {prefix + "atan2"});
 }
-
-} // namespace sparksql
-} // namespace bytedance::bolt::functions
+} // namespace bytedance::bolt::functions::sparksql

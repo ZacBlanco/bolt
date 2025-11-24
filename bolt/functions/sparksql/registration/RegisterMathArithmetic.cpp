@@ -18,8 +18,7 @@
 #include "velox/functions/prestosql/Arithmetic.h"
 #include "velox/functions/sparksql/Arithmetic.h"
 
-namespace bytedance::bolt::functions {
-namespace sparksql {
+namespace bytedance::bolt::functions::sparksql {
 
 void registerMathArithmeticFunctions(const std::string& prefix) {
   // Operators.
@@ -56,6 +55,4 @@ void registerMathArithmeticFunctions(const std::string& prefix) {
   // Power function
   registerFunction<PowerFunction, double, double, double>({prefix + "power"});
 }
-
-} // namespace sparksql
-} // namespace bytedance::bolt::functions
+} // namespace bytedance::bolt::functions::sparksql

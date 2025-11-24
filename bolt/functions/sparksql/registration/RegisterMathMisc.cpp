@@ -19,8 +19,7 @@
 #include "velox/functions/sparksql/Arithmetic.h"
 #include "velox/functions/sparksql/Factorial.h"
 
-namespace bytedance::bolt::functions {
-namespace sparksql {
+namespace bytedance::bolt::functions::sparksql {
 
 void registerMathMiscFunctions(const std::string& prefix) {
   // Conversion functions
@@ -66,6 +65,4 @@ void registerMathMiscFunctions(const std::string& prefix) {
       double,
       int64_t>({prefix + "width_bucket"});
 }
-
-} // namespace sparksql
-} // namespace bytedance::bolt::functions
+} // namespace bytedance::bolt::functions::sparksql
