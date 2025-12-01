@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include "velox/functions/Registerer.h"
-#include "velox/functions/prestosql/DateTimeFunctions.h"
-#include "velox/functions/sparksql/DateTimeFunctions.h"
+#include "bolt/functions/Registerer.h"
+#include "bolt/functions/prestosql/DateTimeFunctions.h"
+#include "bolt/functions/sparksql/DateTimeFunctions.h"
 
 namespace bytedance::bolt::functions {
 namespace {

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "velox/functions/lib/RegistrationHelpers.h"
+#include "bolt/functions/lib/RegistrationHelpers.h"
 
 namespace bytedance::bolt::functions {
 

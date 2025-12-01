@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "velox/expression/VectorFunction.h"
-#include "velox/functions/Registerer.h"
-#include "velox/functions/prestosql/DateTimeFunctions.h"
-#include "velox/functions/sparksql/DateTimeFunctions.h"
+#include "bolt/expression/VectorFunction.h"
+#include "bolt/functions/Registerer.h"
+#include "bolt/functions/prestosql/DateTimeFunctions.h"
+#include "bolt/functions/sparksql/DateTimeFunctions.h"
 namespace bytedance::bolt::functions {
 namespace {
 void registerBasicConversionFunctionsInternal(const std::string& prefix) {

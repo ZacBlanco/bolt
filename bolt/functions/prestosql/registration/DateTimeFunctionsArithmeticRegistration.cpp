@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include "velox/expression/VectorFunction.h"
-#include "velox/functions/Registerer.h"
-#include "velox/functions/prestosql/DateTimeFunctions.h"
+#include "bolt/expression/VectorFunction.h"
+#include "bolt/functions/Registerer.h"
+#include "bolt/functions/prestosql/DateTimeFunctions.h"
 namespace bytedance::bolt::functions {
 namespace {
 void registerArithmeticFunctionsInternal(const std::string& prefix) {

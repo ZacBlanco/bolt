@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/functions/lib/RegistrationHelpers.h"
-#include "velox/functions/sparksql/Rand.h"
+#include "bolt/functions/lib/RegistrationHelpers.h"
+#include "bolt/functions/sparksql/Rand.h"
 
 namespace bytedance::bolt::functions::sparksql {
 

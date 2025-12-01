@@ -13,9 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/functions/Registerer.h"
-#include "velox/functions/prestosql/Arithmetic.h"
-#include "velox/functions/prestosql/Probability.h"
+#include "bolt/functions/Registerer.h"
+#include "bolt/functions/prestosql/Arithmetic.h"
+#include "bolt/functions/prestosql/Probability.h"
 
 namespace bytedance::bolt::functions {
 

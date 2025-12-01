@@ -13,11 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/functions/Registerer.h"
-#include "velox/functions/lib/RegistrationHelpers.h"
-#include "velox/functions/prestosql/Arithmetic.h"
-#include "velox/functions/sparksql/Arithmetic.h"
-#include "velox/functions/sparksql/String.h"
+#include "bolt/functions/Registerer.h"
+#include "bolt/functions/lib/RegistrationHelpers.h"
+#include "bolt/functions/prestosql/Arithmetic.h"
+#include "bolt/functions/sparksql/Arithmetic.h"
+#include "bolt/functions/sparksql/String.h"
 
 namespace bytedance::bolt::functions {
 
