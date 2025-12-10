@@ -5,6 +5,8 @@ services:
     build: .
     env_file:
       - variables.env
-    environment:
-      - RUNNER_HOSTNAME=${HOSTNAME:-${HOST:-unknown-host}}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ${HOST_DATA_DIR}/conan-server-data:/data/conan-server-data:r
 

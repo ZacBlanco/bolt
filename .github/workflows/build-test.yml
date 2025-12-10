@@ -7,17 +7,23 @@ on:
     branches: [ main ]
 
 env:
-  CONAN_HOME: ${{ vars.BOLT_RUNNER_CONAN_HOME }}
-  CCACHE_DIR: ${{ vars.BOLT_RUNNER_CCACHE_DIR }}
+  CONAN_HOME: /root/.conan2
+  CCACHE_DIR: /data/ccache-data
   CCACHE_MAX_SIZE: '100G'
+  CI_NUM_THREADS: "16"
 
 jobs:
   build-test:
-    runs-on: [ self-hosted, large ]
+    runs-on: [ self-hosted, medium ]
     container: 
       image: bolt-registry:5000/bolt-ci:latest
       volumes:
-        - ${{ vars.BOLT_RUNNER_CCACHE_DIR }}:${{ vars.BOLT_RUNNER_CCACHE_DIR }}
+        - /data/ccache-data:/data/ccache-data
+    services:
+      conanserver:
+        image: bolt-registry:5000/conan-server:latest
+        volumes:
+          - /data/conan-server-data:/var/conan/data
     strategy:
       matrix: 
         build_type: [ release ]
@@ -27,7 +33,7 @@ jobs:
     - name: Add CI conan remote
       run: |
         source /root/venv/bin/activate
-        conan remote add --index=0 ci http://${{ vars.BOLT_RUNNER_CONAN_HOST }}:9300
+        conan remote add --index=0 ci http://conanserver:9300
       
     - name: Install Bolt dependencies
       run: |
