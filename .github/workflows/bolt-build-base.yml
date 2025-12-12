@@ -1,0 +1,18 @@
+name: 'Bolt Build Setup Steps'
+description: 'Executes necessary commands to setup environment for the bolt build'
+runs:
+  using: "composite"
+  steps:
+    - name: Activate Python venv
+      run: echo "/root/venv/bin" >> $GITHUB_PATH
+
+    - name: Add CI conan remote
+      run: |
+        source /root/venv/bin/activate
+        conan remote add --index=0 ci http://conanserver:9300
+      
+    - name: Install Bolt dependencies
+      run: |
+        source /root/venv/bin/activate
+        ./scripts/install-bolt-deps.sh
+
