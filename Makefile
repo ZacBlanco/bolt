@@ -335,7 +335,8 @@ benchmarks-duckdb-build:
 
 # skip all hdfs test
 # skip TimestampWithTimezone register and test
-unittest: debug_with_test			#: Build with debugging and run unit tests
+unittest: unittest_debug # alias
+unittest_debug: debug_with_test			#: Build with debugging and run unit tests
 	ctest --test-dir $(BUILD_BASE_DIR)/Debug --timeout 7200 -j $(NUM_THREADS) --output-on-failure
 
 unittest_release: release_with_test			#: Build with debugging and run unit tests
