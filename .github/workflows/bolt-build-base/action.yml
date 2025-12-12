@@ -7,11 +7,13 @@ runs:
       run: echo "/root/venv/bin" >> $GITHUB_PATH
 
     - name: Add CI conan remote
+      shell: bash
       run: |
         source /root/venv/bin/activate
         conan remote add --index=0 ci http://conanserver:9300
       
     - name: Install Bolt dependencies
+      shell: bash
       run: |
         source /root/venv/bin/activate
         ./scripts/install-bolt-deps.sh

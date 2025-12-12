@@ -72,8 +72,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v6
-    - id: Environment Setup
-      uses: ./.github/workflows/bolt-build-base.yml
+    - id: env-setup
+      uses: ./.github/workflows/bolt-build-base
 
     - name: Bolt Build
       run: |
@@ -82,3 +82,25 @@ jobs:
     - name: Run tests
       run: |
         make unittest_${{ matrix.build_type }}
+
+  benchmarks-build:
+      runs-on: [ self-hosted, medium ]
+      container: 
+        image: bolt-registry:5000/bolt-ci:latest
+        volumes:
+          - /data/ccache-data:/data/ccache-data
+      services:
+        conanserver:
+          image: bolt-registry:5000/conan-server:latest
+          volumes:
+            - /data/conan-server-data:/var/conan/data
+      steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - id: env-setup
+        uses: ./.github/workflows/bolt-build-base
+
+      - name: Bolt Build
+        run: |
+          source /root/venv/bin/activate
+          make benchmarks-build
