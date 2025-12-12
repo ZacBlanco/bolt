@@ -79,12 +79,14 @@ class MemoryPoolReallocateContiguousBenchMark {
       : type_(type), minSize_(minSize), maxSize_(maxSize) {
     switch (type_) {
       case Type::kMmap:
-        manager_ = std::make_shared<MemoryManager>(
-            MemoryManager::Options{.alignment = alignment});
+        MemoryManager::Options options;
+        options.alignment = alignment;
+        manager_ = std::make_shared<MemoryManager>(options);
         break;
       case Type::kStd:
-        manager_ = std::make_shared<MemoryManager>(
-            MemoryManager::Options{.alignment = alignment});
+        MemoryManager::Options options;
+        options.alignment = alignment;
+        manager_ = std::make_shared<MemoryManager>(options);
         break;
       default:
         BOLT_USER_FAIL("Unknown allocator type: {}", static_cast<int>(type_));
