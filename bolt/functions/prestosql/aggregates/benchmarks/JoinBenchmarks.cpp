@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "bolt/exec/Task.h"
 #include "bolt/exec/tests/utils/AssertQueryBuilder.h"
 #include "bolt/exec/tests/utils/HiveConnectorTestBase.h"
 #include "bolt/exec/tests/utils/PlanBuilder.h"
