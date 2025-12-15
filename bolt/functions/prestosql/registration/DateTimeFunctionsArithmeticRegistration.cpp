@@ -17,6 +17,7 @@
 #include "bolt/expression/VectorFunction.h"
 #include "bolt/functions/Registerer.h"
 #include "bolt/functions/prestosql/DateTimeFunctions.h"
+#include "bolt/functions/sparksql/DateTimeFunctions.h"
 namespace bytedance::bolt::functions {
 namespace {
 void registerArithmeticFunctionsInternal(const std::string& prefix) {
@@ -60,6 +61,55 @@ void registerArithmeticFunctionsInternal(const std::string& prefix) {
   registerFunction<DateFormatFunction, Varchar, Timestamp, Varchar>(
       {prefix + "date_format"});
 #endif
+
+  registerFunction<DateAddFunction, Date, Varchar, int64_t, Date>(
+      {prefix + "date_add"});
+  registerFunction<DateAddFunction, Timestamp, Varchar, int64_t, Timestamp>(
+      {prefix + "date_add", prefix + "timestampadd"});
+  registerFunction<DateAddFunction, Timestamp, Varchar, int32_t, Timestamp>(
+      {prefix + "date_add", prefix + "timestampadd"});
+  registerFunction<
+      DateAddFunction,
+      TimestampWithTimezone,
+      Varchar,
+      int64_t,
+      TimestampWithTimezone>({prefix + "date_add", prefix + "timestampadd"});
+
+  registerFunction<DateAddFunction, Date, Date, int64_t>({prefix + "date_add"});
+  registerFunction<DateAddFunction, Date, Date, int32_t>({prefix + "date_add"});
+  registerFunction<DateAddFunction, Date, Date, int16_t>({prefix + "date_add"});
+  registerFunction<DateAddFunction, Date, Date, int8_t>({prefix + "date_add"});
+
+#ifndef SPARK_COMPATIBLE
+  registerFunction<
+      DateDiffFunction,
+      int64_t,
+      Varchar,
+      TimestampWithTimezone,
+      TimestampWithTimezone>({prefix + "date_diff"});
+  registerFunction<DateDiffFunction, int64_t, Varchar, Timestamp, Timestamp>(
+      {prefix + "date_diff"});
+  registerFunction<DateDiffFunction, int64_t, Date, Date>(
+      {prefix + "date_diff"});
+  registerFunction<DateFormatFunction, Varchar, Timestamp, Varchar>(
+      {prefix + "date_format"});
+  registerFunction<DateFormatFunction, Varchar, TimestampWithTimezone, Varchar>(
+      {prefix + "date_format"});
+  registerFunction<sparksql::LastDayFunction, Varchar, Date>(
+      {prefix + "last_day"});
+#endif
+  registerFunction<HiveDateDiffFunction, int32_t, Date, Date>(
+      {prefix + "datediff"});
+  registerFunction<DateDiffFunction, int64_t, Varchar, Timestamp, Timestamp>(
+      {prefix + "timestampdiff"});
+
+  registerFunction<MonthsBetweenFunction, double, Timestamp, Timestamp>(
+      {prefix + "months_between"});
+  registerFunction<
+      bytedance::bolt::functions::sparksql::NextDayFunction,
+      Date,
+      Date,
+      Varchar>({prefix + "next_day"});
 }
 } // namespace
 

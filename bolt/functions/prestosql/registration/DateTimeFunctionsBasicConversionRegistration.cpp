@@ -115,13 +115,6 @@ void registerBasicConversionFunctionsInternal(const std::string& prefix) {
       int64_t,
       Timestamp,
       Varchar>({prefix + "unix_timestamp", prefix + "to_unix_timestamp"});
-  registerFunction<MonthsBetweenFunction, double, Timestamp, Timestamp>(
-      {prefix + "months_between"});
-  registerFunction<
-      bytedance::bolt::functions::sparksql::NextDayFunction,
-      Date,
-      Date,
-      Varchar>({prefix + "next_day"});
 }
 } // namespace
 

@@ -16,6 +16,7 @@
 
 #include "bolt/functions/Registerer.h"
 #include "bolt/functions/prestosql/DateTimeFunctions.h"
+#include "bolt/functions/sparksql/DateTimeFunctions.h"
 
 namespace bytedance::bolt::functions {
 namespace {
@@ -40,6 +41,8 @@ void registerDateTimeTimeComponentExtractionFunctionsInternal(
       {prefix + "millisecond"});
   registerFunction<MillisecondFunction, int64_t, TimestampWithTimezone>(
       {prefix + "millisecond"});
+
+#ifndef SPARK_COMPATIBLE
   registerFunction<DateTruncFunction, Timestamp, Varchar, Timestamp>(
       {prefix + "date_trunc"});
   registerFunction<DateTruncFunction, Date, Varchar, Date>(
@@ -56,6 +59,7 @@ void registerDateTimeTimeComponentExtractionFunctionsInternal(
       {prefix + "trunc"});
   registerFunction<DateTruncFunction, Date, Varchar, Varchar>(
       {prefix + "trunc"});
+#endif
 }
 } // namespace
 
