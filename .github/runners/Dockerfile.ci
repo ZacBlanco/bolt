@@ -8,7 +8,7 @@ ARG DEB_REGION=""
 ARG https_proxy=""
 ARG no_proxy=""
 
-# check if deb region is not empty string. If it is not, run the sed command. If it is empty, do nothing.
+# check if deb region is not empty string. If it is, replace the default debian repository with the one for the region.
 RUN if [ "$DEB_REGION" != "" ]; then \
     sed -i "s|http://deb.debian.org/debian|http://ftp.${DEB_REGION}.debian.org/debian|g" /etc/apt/sources.list.d/debian.sources; \
 fi
@@ -26,7 +26,6 @@ RUN arch=$(arch) && \
     ln -s /opt/cmake-$CMAKE_VERSION-linux-${arch}/bin/ctest /usr/local/bin/ctest && \
     rm /tmp/cmake.tar.gz
 
-# Install vim, sudo, git, gdb, python3, pip, ssh, ninja, bison, maven
 RUN apt-get update && apt-get install -y \
     sudo \
     bash \
@@ -63,7 +62,6 @@ RUN apt-get update && apt-get install -y \
 
 RUN ln -sf /bin/bash /bin/sh
 
-# Build and install the most recent version of the mold linker
 RUN https_proxy=${https_proxy} curl -L -O --output-dir /tmp https://github.com/rui314/mold/releases/download/v$MOLD_VERSION/mold-$MOLD_VERSION-$(arch)-linux.tar.gz
 RUN cd /tmp && \
     sudo tar -C /usr/local --strip-components=1 -xzf mold-$MOLD_VERSION-$(arch)-linux.tar.gz
@@ -77,11 +75,8 @@ ARG USER_GID=$USER_UID
 
 RUN groupadd --gid $USER_GID $USERNAME \
     && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
-    && apt-get update \
-    && apt-get install -y sudo \
     && echo $USERNAME ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/$USERNAME \
-    && chmod 0440 /etc/sudoers.d/$USERNAME \
-    && rm -rf /var/lib/apt/lists/*
+    && chmod 0440 /etc/sudoers.d/$USERNAME 
 
 USER $USERNAME
 
@@ -94,7 +89,6 @@ RUN virtualenv -p python3 ~/venv \
 RUN source ~/venv/bin/activate && \
     pip install conan==$CONAN_VERSION pydot
 
-# Set up Conan default profile
 RUN source ~/venv/bin/activate && \
     conan profile detect && \
     sed -i 's/gnu14/gnu17/g' ~/.conan2/profiles/default
