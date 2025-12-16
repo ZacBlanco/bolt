@@ -13,19 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+set -euo pipefail
 
 CUR_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
-cd ${CUR_DIR}/
+cd "${CUR_DIR}"
+
+# Does a shallow checkout of conan-center-index at the given commit id in $1
+checkout_conan_center_index() {
+    rm -rf "${cci_home}"
+    mkdir -p "${cci_home}"
+    pushd "${cci_home}"
+    git init
+    git remote add origin https://github.com/conan-io/conan-center-index.git
+    git fetch --depth 1 origin "${1}"
+    git checkout FETCH_HEAD
+    popd
+}
 
 if ! conan remote list | grep -q 'bolt-local'; then
-    conan remote add -t local-recipes-index bolt-local ${CUR_DIR}/conan
+    conan remote add -t local-recipes-index bolt-local "${CUR_DIR}/conan"
 fi 
 
 # Clone conan-center-index and apply Bolt's patch
 cci_home=${CONAN_HOME-~/.conan2}/conan-center-index
-conan_center_commit_id="bad5c95"
-\rm -rf ${cci_home} && git clone https://github.com/conan-io/conan-center-index.git ${cci_home}
-cd  ${cci_home} && git checkout ${conan_center_commit_id}
+conan_center_commit_id="bad5c95b810e859c1c31553b92584246fe436d69"
+checkout_conan_center_index ${conan_center_commit_id}
+
 for patch_file in "${CUR_DIR}/conan/patches"/*.patch; do
     if [ ! -f "$patch_file" ]; then
         continue
@@ -39,7 +52,7 @@ for patch_file in "${CUR_DIR}/conan/patches"/*.patch; do
 done
 
 if ! conan remote list | grep -q 'bolt-cci-local'; then
-    conan remote add -t local-recipes-index bolt-cci-local ${cci_home}
+    conan remote add -t local-recipes-index bolt-cci-local "${cci_home}"
 fi 
 
 # Move conancenter to the end of the list

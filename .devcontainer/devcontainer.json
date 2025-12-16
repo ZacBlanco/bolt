@@ -5,9 +5,15 @@
         "context": "../.github/runners",
         "args": {
             "DEB_REGION": "",
-            "HTTPS_PROXY": ""
+            "https_proxy": "",
+            "no_proxy": ""
         }
     },
+    "containerEnv": {
+        "https_proxy": "",
+        "no_proxy": ""
+    },
+    "remoteUser": "code",
     // Use 'forwardPorts' to make a list of ports inside the container available locally.
     "forwardPorts": [],
     // Use 'portsAttributes' to set default properties for specific forwarded ports.
@@ -18,8 +24,8 @@
     // Use 'mounts' to make files or directories from your local machine available inside the container.
     "mounts": [
         "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
-        "source=${localEnv:HOME}/.conan2,target=/home/${localEnv:USER}/.conan2,type=bind,consistency=cached",
-        "source=bolt-ccache,target=/home/${localEnv:USER}/.ccache,type=volume"
+        "source=conan-cache,target=/home/code/.conan2/p",
+        "source=ccache-cache,target=/home/code/.ccache"
     ],
     // Configure tool-specific properties.
     "features": {}
