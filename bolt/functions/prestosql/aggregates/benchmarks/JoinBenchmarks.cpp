@@ -402,7 +402,7 @@ class VariousAggregatesBenchmark : public HiveConnectorTestBase {
     // configs[core::QueryConfig::kMaxOutputBatchRows] = "1024";
     queryCtx->testingOverrideConfigUnsafe(std::move(configs));
     auto task = exec::Task::create(
-        "t", std::move(plan), 0, queryCtx, Task::ExecutionMode::kParallel);
+        "t", std::move(plan), 0, queryCtx, exec::Task::ExecutionMode::kParallel);
     task->setSpillDirectory("/tmp/" + task->uuid(), false);
     return task;
   }

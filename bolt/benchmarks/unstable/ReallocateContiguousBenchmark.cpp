@@ -77,15 +77,13 @@ class MemoryPoolReallocateContiguousBenchMark {
       size_t minSize,
       size_t maxSize)
       : type_(type), minSize_(minSize), maxSize_(maxSize) {
-    switch (type_) {
-      case Type::kMmap:
         MemoryManager::Options options;
         options.alignment = alignment;
+    switch (type_) {
+      case Type::kMmap:
         manager_ = std::make_shared<MemoryManager>(options);
         break;
       case Type::kStd:
-        MemoryManager::Options options;
-        options.alignment = alignment;
         manager_ = std::make_shared<MemoryManager>(options);
         break;
       default:
