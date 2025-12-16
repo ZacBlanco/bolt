@@ -84,6 +84,8 @@ jobs:
         make unittest_${{ matrix.build_type }}
 
   benchmarks-build:
+      needs: changes
+      if: ${{ needs.changes.outputs.source_changed == 'true' }}
       runs-on: [ self-hosted, medium ]
       container: 
         image: bolt-registry:5000/bolt-ci:latest
