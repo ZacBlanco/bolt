@@ -5,7 +5,8 @@ ENV CONAN_VERSION=2.22.2
 ENV MOLD_VERSION=2.40.4
 
 ARG DEB_REGION=""
-ARG HTTPS_PROXY=""
+ARG https_proxy=""
+ARG no_proxy=""
 
 # check if deb region is not empty string. If it is not, run the sed command. If it is empty, do nothing.
 RUN if [ "$DEB_REGION" != "" ]; then \
@@ -18,7 +19,7 @@ RUN apt-get update && \
     tar
 
 RUN arch=$(arch) && \
-    https_proxy=${HTTPS_PROXY} \
+    https_proxy=${https_proxy} \
     curl -L -# -o /tmp/cmake.tar.gz https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-linux-${arch}.tar.gz  && \
     tar -xzvf /tmp/cmake.tar.gz -C /opt && \
     ln -s /opt/cmake-$CMAKE_VERSION-linux-${arch}/bin/cmake /usr/local/bin/cmake && \
@@ -63,7 +64,7 @@ RUN apt-get update && apt-get install -y \
 RUN ln -sf /bin/bash /bin/sh
 
 # Build and install the most recent version of the mold linker
-RUN https_proxy=${HTTPS_PROXY} curl -L -O --output-dir /tmp https://github.com/rui314/mold/releases/download/v$MOLD_VERSION/mold-$MOLD_VERSION-$(arch)-linux.tar.gz
+RUN https_proxy=${https_proxy} curl -L -O --output-dir /tmp https://github.com/rui314/mold/releases/download/v$MOLD_VERSION/mold-$MOLD_VERSION-$(arch)-linux.tar.gz
 RUN cd /tmp && \
     sudo tar -C /usr/local --strip-components=1 -xzf mold-$MOLD_VERSION-$(arch)-linux.tar.gz
 
@@ -120,7 +121,7 @@ os=Linux
 tools.build:compiler_executables={"c": "clang", "cpp": "clang++"}
 EOF
 
-# Set the working directory
+SHELL ["/bin/bash", "-c"]
 WORKDIR /workspace
 
 ENTRYPOINT ["/bin/bash"]
