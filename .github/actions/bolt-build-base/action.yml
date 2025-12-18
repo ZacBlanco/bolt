@@ -3,9 +3,17 @@ description: 'Executes necessary commands to setup environment for the bolt buil
 runs:
   using: "composite"
   steps:
-    - name: Activate Python venv
+    - name: Setup conan profile
       shell: bash
-      run: echo "/root/venv/bin" >> $GITHUB_PATH
+      run: |
+        conan profile detect
+        sed -i 's/gnu14/gnu17/g' ~/.conan2/profiles/default
+        cat >> ~/.conan2/profiles/default <<EOF
+
+        [conf]
+        tools.build:exelinkflags=['-fuse-ld=mold', '-Wl,--allow-multiple-definition']
+        tools.build:sharedlinkflags=['-fuse-ld=mold', '-Wl,--allow-multiple-definition']
+        EOF
 
     - name: Add CI conan remote
       shell: bash
