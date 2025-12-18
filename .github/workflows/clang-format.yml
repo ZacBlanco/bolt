@@ -48,7 +48,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.source_changed == 'true' }}
     runs-on: [ self-hosted, small ]
-    container: bolt-registry:5000/bolt-ci:latest
+    container: bolt-registry:5000/bolt-ci:20251217
     steps:
     - name: Checkout code
       uses: actions/checkout@v6

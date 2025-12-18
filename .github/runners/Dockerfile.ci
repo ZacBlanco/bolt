@@ -67,6 +67,13 @@ RUN cd /tmp && \
 # Add mold's ld as the first on the path
 env PATH=/usr/local/libexec/mold:$PATH
 
+# Set up default python virtualenv, and make it the default on PATH
+RUN virtualenv -p python3 /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt && \
+    rm -f requirements.txt
+
 ARG USERNAME=code
 ARG USER_UID=1000
 ARG USER_GID=$USER_UID
@@ -78,19 +85,7 @@ RUN groupadd --gid $USER_GID $USERNAME \
 
 USER $USERNAME
 
-# Create a default virtualenv that is activated on login
-RUN virtualenv -p python3 ~/venv \
-    && echo "source ~/venv/bin/activate" >> ~/.bashrc \
-    && echo "source ~/venv/bin/activate" >> ~/.bash_profile \
-    && echo "source ~/venv/bin/activate" >> ~/.profile
-
-COPY requirements.txt .
-
-RUN source ~/venv/bin/activate && pip install --no-cache-dir -r requirements.txt \
-    && rm -f requirements.txt
-
-RUN source ~/venv/bin/activate && \
-    conan profile detect && \
+RUN conan profile detect && \
     sed -i 's/gnu14/gnu17/g' ~/.conan2/profiles/default
 
 # Configure default conan profile to use the mold linker
@@ -115,7 +110,8 @@ os=Linux
 tools.build:compiler_executables={"c": "clang", "cpp": "clang++"}
 EOF
 
-SHELL ["/bin/bash", "-c"]
+ENV SHELL=/bin/bash
+
 WORKDIR /workspace
 
-ENTRYPOINT ["/bin/bash"]
+ENTRYPOINT ["/bin/bash", "-c"]
