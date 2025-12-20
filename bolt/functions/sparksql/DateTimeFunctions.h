@@ -13,11 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#pragma once
-
-#include <boost/algorithm/string.hpp>
-
-/* --------------------------------------------------------------------------
+ /* --------------------------------------------------------------------------
  * Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -31,7 +27,10 @@
  * This modified file is released under the same license.
  * --------------------------------------------------------------------------
  */
-
+ 
+ #pragma once
+ 
+ #include <boost/algorithm/string.hpp>
 #include <date/iso_week.h>
 
 #include "bolt/functions/lib/DateTimeFormatter.h"
