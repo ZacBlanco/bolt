@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# find_package(BISON REQUIRED)
-# find_package(FLEX REQUIRED)
 # --------------------------------------------------------------------------
 # Copyright (c) 2025 ByteDance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
@@ -28,6 +26,8 @@
 # --------------------------------------------------------------------------
 
 
+# find_package(BISON REQUIRED)
+# find_package(FLEX REQUIRED)
 # set(BISON_VARS
 #     BISON_FOUND
 #     BISON_EXECUTABLE
