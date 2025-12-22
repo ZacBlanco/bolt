@@ -83,24 +83,38 @@ header:
           http:\/\/www\.apache\.org\/licenses\/LICENSE-2\.0
 
       This modified file is released under the same license\.
-      --------------------------------------------------------------------------)
+      --------------------------------------------------------------------------)|(SPDX-License-Identifier: Apache-2\.0
+      )
 
 
   paths:
     - 'bolt/**'
+    - 'scripts/**'
+    - '*'
 
   paths-ignore:
-    - '_build'
-    - 'bolt/tpch/gen/dbgen/**'
-    - 'license.header'
+    - '**/.clang-format'
+    - '**/.clang-tidy'
+    - '**/.gitattributes'
+    - '**/.gitignore'
+    - '**/*.json'
+    - 'MANIFEST.in'
     - '**/*.md'
-    - 'bolt/dwio/common/tests/Lemire/**'
+    - '**/*.patch'
+    - '.git/**'
+    - '.licenserc.yaml'
+    - 'license.header'
+    - 'bolt/**/*.ll'
+    - 'bolt/**/*.yy'
     - 'bolt/**/tests/**/*.txt'
+    - 'bolt/dwio/common/tests/Lemire/**'
+    - 'bolt/external/hdfs/ArrowHdfsInternal.cpp'
     - 'bolt/functions/prestosql/coverage/**/*.txt'
     - 'bolt/functions/sparksql/coverage/data/**/*.txt'
-    - 'bolt/functions/sparksql/tests/data/**/*.json'
-    - '**/*.ll'
-    - '**/*.yy'
+    - 'bolt/tpch/gen/dbgen/**'
+    - 'LICENSE'
+    - 'NOTICE.txt'
+    - 'scripts/conan/patches/**'
 
 
   comment: on-failure
