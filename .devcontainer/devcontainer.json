@@ -11,7 +11,8 @@
     },
     "containerEnv": {
         "https_proxy": "",
-        "no_proxy": ""
+        "no_proxy": "",
+        "SHELL": "/bin/bash"
     },
     "remoteUser": "code",
     // Use 'forwardPorts' to make a list of ports inside the container available locally.

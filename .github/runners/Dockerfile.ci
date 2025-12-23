@@ -67,6 +67,13 @@ RUN cd /tmp && \
 # Add mold's ld as the first on the path
 env PATH=/usr/local/libexec/mold:$PATH
 
+# License header check tool
+RUN https_proxy=${https_proxy} curl -L -# -o /tmp/skywalking-eyes-bin.tgz https://dlcdn.apache.org/skywalking/eyes/0.8.0/skywalking-license-eye-0.8.0-bin.tgz && \
+    mkdir -p /opt/skywalking-license-eye && \
+    sudo tar -C /opt/skywalking-license-eye --strip-components=1 -xzf /tmp/skywalking-eyes-bin.tgz
+
+ENV PATH="/opt/skywalking-license-eye/bin/linux:${PATH}"
+    
 # Set up default python virtualenv, and make it the default on PATH
 RUN virtualenv -p python3 /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
