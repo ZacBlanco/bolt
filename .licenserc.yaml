@@ -111,7 +111,6 @@ header:
     - 'bolt/tpch/gen/dbgen/**'
     - 'LICENSE'
     - 'MANIFEST.in'
-    - 'NOTICE.txt'
     - 'scripts/conan/patches/**'
 
 
