@@ -51,6 +51,7 @@ jobs:
               - 'CMakeLists.txt'
               - 'bolt/**/CMakeLists.txt'
               - 'scripts/**'
+              - '.github/workflows/**'
   build-test:
     needs: changes
     if: ${{ needs.changes.outputs.source_code == 'true' }}
