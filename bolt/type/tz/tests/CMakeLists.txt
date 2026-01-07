@@ -29,6 +29,10 @@ add_executable(bolt_type_tz_test TimeZoneMapTest.cpp)
 
 add_test(bolt_type_tz_test bolt_type_tz_test)
 
-target_link_libraries(
-  bolt_type_tz_test bolt_type_tz bolt_exception GTest::gtest GTest::gtest_main pthread
-)
+target_link_libraries(bolt_type_tz_test
+                      bolt_type_tz
+                      bolt_test_util
+                      bolt_exception
+                      GTest::gtest
+                      GTest::gtest_main
+                      pthread)
