@@ -808,11 +808,15 @@ arrow::Result<std::unique_ptr<InMemoryPayload>> InMemoryPayload::merge(
             std::dynamic_pointer_cast<arrow::ResizableBuffer>(sourceBuffer);
         if (resizable) {
           // If source is resizable, resize and reuse source.
-          RETURN_NOT_OK(resizable->Resize(mergedSize));
+          RETURN_NOT_OK(resizable->Resize(mergedSize + simd::kPadding));
+          RETURN_NOT_OK(resizable->Resize(mergedSize, false));
         } else {
           // Otherwise copy source.
           ARROW_ASSIGN_OR_RAISE(
-              resizable, arrow::AllocateResizableBuffer(mergedSize, pool));
+              resizable,
+              arrow::AllocateResizableBuffer(
+                  mergedSize + simd::kPadding, pool));
+          RETURN_NOT_OK(resizable->Resize(mergedSize, false));
           memcpy(
               resizable->mutable_data(),
               sourceBuffer->data(),
