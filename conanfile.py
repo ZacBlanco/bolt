@@ -172,6 +172,7 @@ class BoltConan(ConanFile):
         "enable_test": [True, False],
         "build_benchmark": ["off", "basic", "on"],
         "enable_coverage": [True, False],
+        "ci_debug_minsize": [True, False],
         # format options
         "enable_parquet": [True, False],
         "enable_orc": [True, False],
@@ -205,6 +206,7 @@ class BoltConan(ConanFile):
         # False by default, to avoid linking
         "enable_test": False,
         "build_benchmark": "off",
+        "ci_debug_minsize": False,
         "enable_coverage": False,
         "enable_parquet": True,
         "enable_orc": True,
@@ -497,6 +499,9 @@ class BoltConan(ConanFile):
         tc = CMakeToolchain(self, generator="Ninja")
 
         tc.cache_variables["MAX_LINK_JOBS"] = num_link_job
+        
+        if self.options.get_safe("ci_debug_minsize"):
+            tc.cache_variables["CMAKE_CXX_FLAGS_DEBUG"] = ""
 
         if str(self.settings.arch) in ["x86", "x86_64"]:
             flags = (
