@@ -171,6 +171,13 @@ else
 	NUM_LINK_JOB ?= $(CI_NUM_LINK_JOB)
 endif
 
+ifeq ($(IN_CI), 1)
+	CI_MIN_SIZE_DEBUG ?= True
+else
+	CI_MIN_SIZE_DEBUG ?= False
+endif
+
+
 CPU_TARGET ?= "avx"
 
 ifeq ($(UNAME_S),Darwin)
