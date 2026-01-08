@@ -41,4 +41,4 @@ RUN chmod +x /usr/local/bin/start-conan-server.sh
 EXPOSE 9300
 
 # Start Conan server using the custom script
-CMD ["/usr/local/bin/start-conan-server.sh", "--no-admin"]
+CMD ["/usr/local/bin/start-conan-server.sh"]

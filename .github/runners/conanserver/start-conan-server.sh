@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# check if $1 exists, and is "--no-admin"
-ARG=${1:-""}
-if [[ "${ARG}" == "--no-admin" ]]; then
+if [[ -n ${CONAN_ADMIN_USER+x} ]] || [[ -n ${CONAN_ADMIN_PASSWORD+x} ]]; then
+    echo "Starting conan server with admin credentials"
+    NEEDS_ADMIN=1
+else
     echo "Starting read-only conan server"
     NEEDS_ADMIN=0
-    shift
-else
-    NEEDS_ADMIN=1
-fi  
+fi
+
 
 
 if [[ "$NEEDS_ADMIN" == "1" ]]; then
