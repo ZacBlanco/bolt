@@ -173,6 +173,7 @@ endif
 
 ifeq ($(IN_CI), 1)
 	CI_MIN_SIZE_DEBUG ?= True
+	export DEPENDENCY_BUILD_TYPE = Release
 else
 	CI_MIN_SIZE_DEBUG ?= False
 endif
@@ -251,17 +252,26 @@ conan_build:
 	conan graph info ../.. $${ALL_CONAN_OPTIONS} --format=html > bolt.conan.graph.html  && \
 	export NUM_LINK_JOB=$(NUM_LINK_JOB) && \
 	conan install ../.. --name=bolt --version=${BUILD_VERSION} --user=${BUILD_USER} --channel=${BUILD_CHANNEL} \
-	   -s llvm-core/*:build_type=Release -s build_type=${BUILD_TYPE} $${ALL_CONAN_OPTIONS} --build=missing && \
+	   -s llvm-core/*:build_type=Release \
+	   -s build_type=${BUILD_TYPE} \
+	   -s "&:build_type=$${DEPENDENCY_BUILD_TYPE:-${BUILD_TYPE}}" \
+	$${ALL_CONAN_OPTIONS} --build=missing && \
 	NUM_THREADS=$(NUM_THREADS) \
 	conan build ../.. --name=bolt --version=${BUILD_VERSION} --user=${BUILD_USER} --channel=${BUILD_CHANNEL} \
-	   -s llvm-core/*:build_type=Release -s build_type=${BUILD_TYPE} --build=missing $${ALL_CONAN_OPTIONS} && \
+	   -s llvm-core/*:build_type=Release \
+	   -s build_type=${BUILD_TYPE} \
+	   -s "&:build_type=$${DEPENDENCY_BUILD_TYPE:-${BUILD_TYPE}}" \
+	   --build=missing $${ALL_CONAN_OPTIONS} && \
 	cd -
 
 export_base:
 	cd _build/${BUILD_TYPE} && \
 	read ALL_CONAN_OPTIONS < conan.options && \
 	conan export-pkg --name=bolt --version=${BUILD_VERSION} --user=${BUILD_USER} --channel=${BUILD_CHANNEL} \
-	 $${ALL_CONAN_OPTIONS} -s llvm-core/*:build_type=Release -s build_type=${BUILD_TYPE} ../.. && \
+	 $${ALL_CONAN_OPTIONS} \
+	 -s llvm-core/*:build_type=Release \
+	 -s build_type=${BUILD_TYPE} \
+	 -s "&:build_type=$${DEPENDENCY_BUILD_TYPE:-${BUILD_TYPE}}" ../.. && \
 	cd -
 
 export_debug:
