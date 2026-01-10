@@ -85,7 +85,7 @@ jobs:
       run: |
         make unittest_${{ matrix.build_type }}
 
-  benchmarks-build:
+  build-only:
       needs: changes
       if: ${{ needs.changes.outputs.source_code == 'true' }}
       runs-on: [ self-hosted, medium ]
@@ -99,6 +99,9 @@ jobs:
           image: bolt-registry:5000/conan-server:latest
           volumes:
             - /data/conan-server-data:/var/conan/data
+      strategy:
+        matrix:
+          build_target: [ benchmarks-build, debug_with_test ]
       steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -108,4 +111,4 @@ jobs:
 
       - name: Bolt build
         run: |
-          make benchmarks-build
+          make ${{ matrix.build_target }}

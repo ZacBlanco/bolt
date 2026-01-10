@@ -50,7 +50,11 @@ else()
   message(WARNING "Git not found, cannot set version info")
 endif()
 
-string(TIMESTAMP BOLT_BUILD_TIME "%Y-%m-%d %H:%M:%S")
+set(BOLT_BUILD_TIME "" CACHE STRING "Bolt build time")
+if(BOLT_BUILD_TIME STREQUAL "")
+  string(TIMESTAMP BOLT_BUILD_TIME "%Y-%m-%d %H:%M:%S")
+  set(BOLT_BUILD_TIME "${BOLT_BUILD_TIME}" CACHE STRING "Bolt build time" FORCE)
+endif()
 
 cmake_host_system_information(RESULT _hostname QUERY HOSTNAME)
 cmake_host_system_information(RESULT _proc_desc QUERY PROCESSOR_DESCRIPTION)
@@ -87,8 +91,14 @@ if(NOT GIT_DIFF_RESULT EQUAL 0)
 
 endif()
 
+# Get template file's relative path (relative to source directory)
+file(RELATIVE_PATH REL_PATH "${CMAKE_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
+# Build output directory path (in _build/ while maintaining the same relative path)
+set(OUTPUT_DIR "${CMAKE_BINARY_DIR}/gen_cpp/${REL_PATH}")
+# Ensure output directory exists
+file(MAKE_DIRECTORY ${OUTPUT_DIR})
 # generate version.h
 configure_file(
-  "${CMAKE_SOURCE_DIR}/bolt/version/version.h.in" "${CMAKE_SOURCE_DIR}/bolt/version/version.h"
+  "${CMAKE_SOURCE_DIR}/bolt/version/version.h.in" "${OUTPUT_DIR}/bolt/version/version.h"
   @ONLY
 )
