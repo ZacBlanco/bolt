@@ -67,6 +67,9 @@ target_link_libraries(
 
 set_property(TARGET bolt_functions_spark_impl PROPERTY JOB_POOL_COMPILE high_memory_pool)
 
+# directory for generated version.h
+include_directories("${CMAKE_BINARY_DIR}/gen_cpp")
+
 add_subdirectory(window)
 
 if(${BOLT_ENABLE_AGGREGATES})
