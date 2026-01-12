@@ -703,7 +703,7 @@ static std::string codepointToUtf16SurrogatePairs(uint32_t codepoint) {
   uint32_t lowSurrogate = 0xDC00 + (codepoint & 0x3FF);
 
   // Allocate a buffer for the formatted output
-  char buffer[16]; // Enough space for "\\uXXXX\\uXXXX" plus null terminator
+  char buffer[13]; // Enough space for "\\uXXXX\\uXXXX" plus null terminator
 
   // Format the surrogate pairs into the buffer using snprintf
   snprintf(
