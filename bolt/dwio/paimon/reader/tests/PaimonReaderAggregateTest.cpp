@@ -84,7 +84,6 @@ class PaimonReaderAggregateTest : public testing::Test,
     rootPool_.reset();
   }
 
-
   std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
   getIdentityAssignment(RowTypePtr rowType) {
     std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>

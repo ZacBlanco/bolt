@@ -240,8 +240,9 @@ HiveDataSource::HiveDataSource(
 
   readerOutputType_ = ROW(std::move(readerRowNames), std::move(readerRowTypes));
   const auto& names = readerOutputType_->names();
-  const auto readColumnsAsLowercase = hiveConfig_->isFileColumnNamesReadAsLowerCase(
-      connectorQueryCtx_->sessionProperties());
+  const auto readColumnsAsLowercase =
+      hiveConfig_->isFileColumnNamesReadAsLowerCase(
+          connectorQueryCtx_->sessionProperties());
   // Each element is a pair of column index and column name
   std::vector<std::tuple<size_t, std::optional<std::string>>> rowIndexColumns;
   for (int i = 0; i < names.size(); ++i) {

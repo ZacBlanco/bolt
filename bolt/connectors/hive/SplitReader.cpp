@@ -33,7 +33,6 @@
 
 #include "bolt/common/caching/CacheTTLController.h"
 #include "bolt/connectors/hive/HiveConfig.h"
-#include "bolt/connectors/hive/HiveConfig.h"
 #include "bolt/connectors/hive/HiveConnectorSplit.h"
 #include "bolt/connectors/hive/HiveConnectorUtil.h"
 #include "bolt/connectors/hive/PaimonConstants.h"
