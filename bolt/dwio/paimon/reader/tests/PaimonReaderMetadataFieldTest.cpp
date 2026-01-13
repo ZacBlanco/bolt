@@ -114,7 +114,7 @@ class PaimonReaderMetadataFieldTest
       std::unordered_map<std::string, std::string> customProperties = {},
       bool readAsLowerCase = false) {
     core::PlanNodeId scanNodeId;
-    auto readPlanBuilder = exec::test::PlanBuilder();
+    auto readPlanBuilder = exec::test::PlanBuilder(leafPool_.get());
     auto readPlanFragment =
         exec::test::PlanBuilder::TableScanBuilder(readPlanBuilder)
             .tableName("hive_table")
@@ -545,7 +545,7 @@ TEST_F(PaimonReaderMetadataFieldTest, testPaimonRowIndexWithSelectiveFilter) {
       expected,
       std::nullopt,
       std::nullopt,
-      {"b = 0"});
+      {"b = 0::INTEGER"});
 }
 
 TEST_F(PaimonReaderMetadataFieldTest, testPaimonRowId) {
@@ -837,7 +837,7 @@ TEST_F(PaimonReaderMetadataFieldTest, testPaimonFilePathColumnMultiFile) {
       });
 
   core::PlanNodeId scanNodeId;
-  auto readPlanBuilder = exec::test::PlanBuilder();
+  auto readPlanBuilder = exec::test::PlanBuilder(leafPool_.get());
   auto readPlanFragment =
       exec::test::PlanBuilder::TableScanBuilder(readPlanBuilder)
           .tableName("hive_table")
