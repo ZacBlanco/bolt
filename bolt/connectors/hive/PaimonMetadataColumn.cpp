@@ -61,7 +61,7 @@ MetadataColumnPartition::MetadataColumnPartition(
     fieldTypes.push_back(fieldType);
 
     if (value.has_value()) {
-      auto convertedValue = bolt_DYNAMIC_SCALAR_TYPE_DISPATCH(
+      auto convertedValue = BOLT_DYNAMIC_SCALAR_TYPE_DISPATCH(
           hive::convertFromString, fieldType->kind(), value);
       childVectors.push_back(
           BaseVector::createConstant(fieldType, convertedValue, 1, pool));

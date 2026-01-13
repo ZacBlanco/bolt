@@ -142,7 +142,8 @@ class PaimonReaderMetadataFieldTest
             core::QueryConfig{{}},
             {{"test-hive",
               std::make_shared<config::ConfigBase>(
-                  std::move(connectorSessionProperties))}}));
+                  std::move(connectorSessionProperties))}}),
+        exec::Task::ExecutionMode::kSerial);
 
     if (readType->containsChild(kSEQUENCE_NUMBER) &&
         customProperties.find(kFileMetaMaxSequenceNumber) ==
@@ -330,7 +331,7 @@ TEST_F(PaimonReaderMetadataFieldTest, testPaimonRowIndexWithFilters) {
       expected,
       std::nullopt,
       std::nullopt,
-      {"a <= 102"});
+      {"a <= 102::INTEGER"});
   // flip the order
   readType = ROW({{kColumnNameRowIndex, BIGINT()}, {"a", INTEGER()}});
   assignments = getIdentityAssignment(readType);
@@ -351,7 +352,7 @@ TEST_F(PaimonReaderMetadataFieldTest, testPaimonRowIndexWithFilters) {
       expected,
       std::nullopt,
       std::nullopt,
-      {"a <= 102"});
+      {"a <= 102::INTEGER"});
 
   // row index only
   readType = ROW({{kColumnNameRowIndex, BIGINT()}});
@@ -371,7 +372,7 @@ TEST_F(PaimonReaderMetadataFieldTest, testPaimonRowIndexWithFilters) {
       expected,
       std::nullopt,
       std::nullopt,
-      {"a <= 102"});
+      {"a <= 102::INTEGER"});
 
   // row index only, multiple row groups
   const int64_t rowCount = 14899;
@@ -397,7 +398,7 @@ TEST_F(PaimonReaderMetadataFieldTest, testPaimonRowIndexWithFilters) {
       expected,
       std::nullopt,
       std::nullopt,
-      {"a < 15000"});
+      {"a < 15000::INTEGER"});
 }
 
 TEST_F(
@@ -858,7 +859,8 @@ TEST_F(PaimonReaderMetadataFieldTest, testPaimonFilePathColumnMultiFile) {
           core::QueryConfig{{}},
           {{"test-hive",
             std::make_shared<config::ConfigBase>(
-                std::unordered_map<std::string, std::string>())}}));
+                std::unordered_map<std::string, std::string>())}}),
+      exec::Task::ExecutionMode::kSerial);
 
   auto filePaths = getFilePaths(tempDir->getPath());
 

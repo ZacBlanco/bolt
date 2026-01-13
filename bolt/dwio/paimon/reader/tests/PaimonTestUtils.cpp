@@ -46,7 +46,7 @@ RowTypePtr createPaimonFile(
 
   const auto& colNames = rowType->names();
   const auto& colTypes = rowType->children();
-  bolt_CHECK(!data.empty(), "data must not be empty");
+  BOLT_CHECK(!data.empty(), "data must not be empty");
   const auto inputSize = data[0]->size();
 
   for (int i : primaryKeyIndices) {
@@ -107,7 +107,8 @@ RowTypePtr createPaimonFile(
       "my_write_task",
       writerPlanFragment,
       0,
-      std::make_shared<core::QueryCtx>(executor.get()));
+      core::QueryCtx::create(executor.get()),
+      exec::Task::ExecutionMode::kSerial);
 
   while (auto result = writeTask->next())
     ;

@@ -269,7 +269,8 @@ core::PlanNodePtr PlanBuilder::TableScanBuilder::build(core::PlanNodeId id) {
         isFilterPushdownEnabled_,
         std::move(filters),
         remainingFilterExpr,
-        dataColumns_);
+        dataColumns_,
+        parameters_);
   }
   core::PlanNodePtr result = std::make_shared<core::TableScanNode>(
       id, outputType_, tableHandle_, assignments_);

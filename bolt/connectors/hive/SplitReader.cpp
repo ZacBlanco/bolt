@@ -190,7 +190,7 @@ void SplitReader::computeMetadataColumns() {
       char* end;
       const auto firstRowID =
           std::strtol(firstRowIDIter->second.c_str(), &end, 10);
-      bolt_CHECK_NE(
+      BOLT_CHECK_NE(
           end,
           nullptr,
           "Failed to convert _FIRST_ROW_ID {} to long",
@@ -207,7 +207,7 @@ void SplitReader::computeMetadataColumns() {
       metadataColumns_[i] = std::make_shared<paimon::MetadataColumnFilePath>(
           hiveSplit_->filePath);
     } else if (paimon::kColumnNameBucket == name) {
-      bolt_CHECK(
+      BOLT_CHECK(
           hiveSplit_->tableBucketNumber.has_value(),
           "Bucket value is not set when paimon bucket column is requested");
       metadataColumns_[i] = std::make_shared<paimon::MetadataColumnBucket>(
@@ -225,7 +225,7 @@ void SplitReader::computeMetadataColumns() {
       char* end;
       auto maxSequenceNumber =
           std::strtol(maxSequenceNumberIter->second.c_str(), &end, 10);
-      bolt_CHECK_NE(
+      BOLT_CHECK_NE(
           end,
           nullptr,
           "Failed to convert _MAX_SEQUENCE_NUMBER {} to long",

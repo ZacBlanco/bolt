@@ -637,7 +637,7 @@ void HiveDataSource::addSplit(
   const auto& tableParameters = hiveTableHandle_->tableParameters();
   // append-only tables don't need to read additional fields
   if (tableParameters.find(paimon::kPrimaryKey) == tableParameters.end()) {
-    bolt_USER_CHECK(
+    BOLT_USER_CHECK(
         split->hiveSplits.size() == 1,
         "Append-only tables should only have a single split");
     splitReader_ = createConfiguredSplitReader(split->hiveSplits[0], false);

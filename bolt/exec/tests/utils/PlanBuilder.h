@@ -305,6 +305,14 @@ class PlanBuilder {
       return *this;
     }
 
+    /// @param params additional key/value parameters to add the to
+    /// HiveTableHandle.
+    TableScanBuilder& parameters(
+        std::unordered_map<std::string, std::string> params) {
+      parameters_ = std::move(params);
+      return *this;
+    }
+
     /// Stop the TableScanBuilder.
     PlanBuilder& endTableScan() {
       planBuilder_.planNode_ = build(planBuilder_.nextPlanNodeId());
@@ -326,6 +334,7 @@ class PlanBuilder {
     std::shared_ptr<connector::ConnectorTableHandle> tableHandle_;
     std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
         assignments_;
+    std::unordered_map<std::string, std::string> parameters_;
     bool isFilterPushdownEnabled_;
 
     // produce filters as a FilterNode instead of pushdown.
