@@ -211,6 +211,7 @@ void StructColumnReader::seekToRowGroup(int64_t index) {
   BufferPtr noBuffer;
   formatData_->as<ParquetData>().setNulls(noBuffer, 0);
   readOffset_ = 0;
+  rowGroupOffset_ = formatData_->as<ParquetData>().rowGroupOffset(index);
   for (auto& child : children_) {
     child->seekToRowGroup(index);
   }

@@ -343,7 +343,9 @@ std::shared_ptr<common::ScanSpec> makeScanSpec(
         infoColumns,
     memory::MemoryPool* pool,
     core::ExpressionEvaluator* expressionEvaluator,
-    dwio::common::RuntimeStatistics* statis) {
+    dwio::common::RuntimeStatistics* statis,
+    const std::vector<std::tuple<size_t, std::optional<std::string>>>&
+        rowIndexColumns) {
   auto spec = std::make_shared<common::ScanSpec>("root");
   spec->setRuntimeStatistics(statis);
   spec->setExpressionEvaluator(expressionEvaluator);
@@ -357,14 +359,20 @@ std::shared_ptr<common::ScanSpec> makeScanSpec(
       filterSubfields[getColumnName(subfield)].push_back(&subfield);
     }
   }
-
+  auto rowIdxIter = rowIndexColumns.begin();
   // Process columns that will be projected out.
   for (int i = 0; i < rowType->size(); ++i) {
-    auto& name = rowType->nameOf(i);
-    auto& type = rowType->childAt(i);
+    const auto& name = rowType->nameOf(i);
+    const auto& type = rowType->childAt(i);
     auto it = outputSubfields.find(name);
     if (it == outputSubfields.end()) {
-      spec->addFieldRecursively(name, *type, i);
+      const auto& childSpec = spec->addFieldRecursively(name, *type, i);
+      if (rowIdxIter != rowIndexColumns.end() &&
+          i == std::get<0>(*rowIdxIter)) {
+        childSpec->setIsRowIndex(true);
+        childSpec->setRowIndexColumnName(std::get<1>(*rowIdxIter));
+        ++rowIdxIter;
+      }
       filterSubfields.erase(name);
       continue;
     }

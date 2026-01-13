@@ -42,6 +42,7 @@
 #include "bolt/connectors/hive/PaimonConnectorSplit.h"
 #include "bolt/connectors/hive/PaimonConstants.h"
 #include "bolt/connectors/hive/paimon_merge_engines/PaimonRowKind.h"
+#include "bolt/dwio/paimon/reader/tests/PaimonTestUtils.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
 
 #include <folly/init/Init.h>
@@ -80,73 +81,6 @@ class PaimonReaderDeduplicateTest
 
   void TearDown() override {
     connector::unregisterConnector(kHiveConnectorId);
-  }
-
-  RowTypePtr createPaimonFile(
-      std::string outputDirectoryPath,
-      std::shared_ptr<folly::Executor> executor,
-      std::vector<int> primaryKeyIndices,
-      RowTypePtr rowType,
-      std::vector<std::vector<int32_t>> data,
-      std::vector<int64_t> sequenceNumber,
-      std::vector<int8_t> valueKind) {
-    std::vector<std::string> names;
-    std::vector<TypePtr> types;
-    std::vector<VectorPtr> fileData;
-
-    const auto& colNames = rowType->names();
-    const auto& colTypes = rowType->children();
-    for (int i : primaryKeyIndices) {
-      names.push_back(connector::paimon::kKEY_FIELD_PREFIX + colNames[i]);
-      types.push_back(colTypes[i]);
-      auto primaryKeyCol = vectorMaker_.flatVector<int32_t>(data[i]);
-      fileData.push_back(primaryKeyCol);
-    }
-
-    auto primaryKeyNames = colNames;
-
-    names.push_back(connector::paimon::kSEQUENCE_NUMBER);
-    types.push_back(BIGINT());
-    fileData.push_back(vectorMaker_.flatVector<int64_t>(sequenceNumber));
-
-    names.push_back(connector::paimon::kVALUE_KIND);
-    types.push_back(TINYINT());
-    fileData.push_back(vectorMaker_.flatVector<int8_t>(valueKind));
-
-    names.insert(names.end(), colNames.begin(), colNames.end());
-    types.insert(types.end(), colTypes.begin(), colTypes.end());
-    for (const auto& colData : data) {
-      fileData.push_back(vectorMaker_.flatVector<int32_t>(colData));
-    }
-
-    auto fileRowType =
-        std::make_shared<RowType>(std::move(names), std::move(types));
-
-    auto rowVector = std::make_shared<RowVector>(
-        leafPool_.get(),
-        fileRowType,
-        BufferPtr(nullptr),
-        sequenceNumber.size(),
-        fileData);
-
-    auto writerPlanFragment =
-        exec::test::PlanBuilder()
-            .values({rowVector})
-            .orderBy(primaryKeyNames, false)
-            .tableWrite(outputDirectoryPath, dwio::common::FileFormat::PARQUET)
-            .planFragment();
-
-    auto writeTask = exec::Task::create(
-        "my_write_task",
-        writerPlanFragment,
-        0,
-        core::QueryCtx::create(executor.get()),
-        exec::Task::ExecutionMode::kSerial);
-
-    while (auto result = writeTask->next())
-      ;
-
-    return fileRowType;
   }
 
   std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
@@ -210,6 +144,8 @@ TEST_F(PaimonReaderDeduplicateTest, insertAllUpdate) {
 
   auto rowType = ROW({{"a", INTEGER()}, {"b", INTEGER()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -219,6 +155,8 @@ TEST_F(PaimonReaderDeduplicateTest, insertAllUpdate) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -312,6 +250,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicNoUpdate) {
 
   auto rowType = ROW({{"a", INTEGER()}, {"b", INTEGER()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -321,6 +261,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicNoUpdate) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -414,6 +356,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicFirstUpdate) {
 
   auto rowType = ROW({{"a", INTEGER()}, {"b", INTEGER()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -423,6 +367,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicFirstUpdate) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -516,6 +462,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicLastUpdate) {
 
   auto rowType = ROW({{"a", INTEGER()}, {"b", INTEGER()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -525,6 +473,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicLastUpdate) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -619,6 +569,8 @@ TEST_F(PaimonReaderDeduplicateTest, differentPrimaryKeys) {
 
   auto rowType = ROW({{"a", INTEGER()}, {"b", INTEGER()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -628,6 +580,8 @@ TEST_F(PaimonReaderDeduplicateTest, differentPrimaryKeys) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -721,6 +675,8 @@ TEST_F(PaimonReaderDeduplicateTest, multiplePrimaryKeys) {
 
   auto rowType = ROW({{"a", INTEGER()}, {"b", INTEGER()}, {"c", INTEGER()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0, 1},
@@ -730,6 +686,8 @@ TEST_F(PaimonReaderDeduplicateTest, multiplePrimaryKeys) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0, 1},
@@ -824,6 +782,8 @@ TEST_F(PaimonReaderDeduplicateTest, multiplePrimaryKeysReverse) {
 
   auto rowType = ROW({{"a", INTEGER()}, {"b", INTEGER()}, {"c", INTEGER()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {1, 0},
@@ -833,6 +793,8 @@ TEST_F(PaimonReaderDeduplicateTest, multiplePrimaryKeysReverse) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {1, 0},
@@ -926,6 +888,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicIgnoreDeleteAll) {
 
   auto rowType = ROW({{"a", INTEGER()}, {"b", INTEGER()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -935,6 +899,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicIgnoreDeleteAll) {
       {int8_t(PaimonRowKind::DELETE), int8_t(PaimonRowKind::DELETE)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -1019,6 +985,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicIgnoreLastDelete) {
 
   auto rowType = ROW({{"a", INTEGER()}, {"b", INTEGER()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -1028,6 +996,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicIgnoreLastDelete) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -1125,6 +1095,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicIgnoreNonLastDelete) {
     1   1  5       4                +I
     2   2  6       6                +I  */
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -1134,6 +1106,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicIgnoreNonLastDelete) {
       {int8_t(PaimonRowKind::DELETE), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -1226,6 +1200,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicNoIgnoreLastDelete) {
     2   2  6       6                +I  */
   auto rowType = ROW({{"a", INTEGER()}, {"b", INTEGER()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -1235,6 +1211,8 @@ TEST_F(PaimonReaderDeduplicateTest, basicNoIgnoreLastDelete) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -1335,7 +1313,15 @@ TEST_F(PaimonReaderDeduplicateTest, basicMultipleBatchesAllUpdate) {
       len, static_cast<int8_t>(PaimonRowKind::INSERT));
 
   auto fileRowType = createPaimonFile(
-      tempDir->getPath(), executor, {0}, rowType, {a1, b1}, seqNum, valueKind);
+      vectorMaker_,
+      leafPool_.get(),
+      tempDir->getPath(),
+      executor,
+      {0},
+      rowType,
+      {a1, b1},
+      seqNum,
+      valueKind);
 
   std::vector<int> a2(len);
   std::iota(a2.begin(), a2.end(), 1);
@@ -1350,7 +1336,15 @@ TEST_F(PaimonReaderDeduplicateTest, basicMultipleBatchesAllUpdate) {
   });
 
   auto fileRowType2 = createPaimonFile(
-      tempDir->getPath(), executor, {0}, rowType, {a2, b2}, seqNum2, valueKind);
+      vectorMaker_,
+      leafPool_.get(),
+      tempDir->getPath(),
+      executor,
+      {0},
+      rowType,
+      {a2, b2},
+      seqNum2,
+      valueKind);
 
   core::PlanNodeId scanNodeId;
 
@@ -1451,7 +1445,15 @@ TEST_F(PaimonReaderDeduplicateTest, basicMultipleBatchesNoUpdate) {
       len, static_cast<int8_t>(PaimonRowKind::INSERT));
 
   auto fileRowType = createPaimonFile(
-      tempDir->getPath(), executor, {0}, rowType, {a1, b1}, seqNum, valueKind);
+      vectorMaker_,
+      leafPool_.get(),
+      tempDir->getPath(),
+      executor,
+      {0},
+      rowType,
+      {a1, b1},
+      seqNum,
+      valueKind);
 
   std::vector<int> a2(len);
   std::iota(a2.begin(), a2.end(), 1);
@@ -1466,7 +1468,15 @@ TEST_F(PaimonReaderDeduplicateTest, basicMultipleBatchesNoUpdate) {
   });
 
   auto fileRowType2 = createPaimonFile(
-      tempDir->getPath(), executor, {0}, rowType, {a2, b2}, seqNum2, valueKind);
+      vectorMaker_,
+      leafPool_.get(),
+      tempDir->getPath(),
+      executor,
+      {0},
+      rowType,
+      {a2, b2},
+      seqNum2,
+      valueKind);
 
   core::PlanNodeId scanNodeId;
 
@@ -1628,7 +1638,15 @@ _KEY_a  _SEQUENCE_NUMBER  _VALUE_KIND      a      b
       len, static_cast<int8_t>(PaimonRowKind::INSERT));
 
   auto fileRowType = createPaimonFile(
-      tempDir->getPath(), executor, {0}, rowType, {a1, b1}, seqNum, valueKind);
+      vectorMaker_,
+      leafPool_.get(),
+      tempDir->getPath(),
+      executor,
+      {0},
+      rowType,
+      {a1, b1},
+      seqNum,
+      valueKind);
 
   std::vector<int> a2(len);
   std::iota(a2.begin(), a2.end(), len / 2 + 1);
@@ -1643,7 +1661,15 @@ _KEY_a  _SEQUENCE_NUMBER  _VALUE_KIND      a      b
   });
 
   auto fileRowType2 = createPaimonFile(
-      tempDir->getPath(), executor, {0}, rowType, {a2, b2}, seqNum2, valueKind);
+      vectorMaker_,
+      leafPool_.get(),
+      tempDir->getPath(),
+      executor,
+      {0},
+      rowType,
+      {a2, b2},
+      seqNum2,
+      valueKind);
 
   core::PlanNodeId scanNodeId;
 

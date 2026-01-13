@@ -72,7 +72,9 @@ std::shared_ptr<common::ScanSpec> makeScanSpec(
         infoColumns,
     memory::MemoryPool* pool,
     core::ExpressionEvaluator* expressionEvaluator = nullptr,
-    dwio::common::RuntimeStatistics* statis = nullptr);
+    dwio::common::RuntimeStatistics* statis = nullptr,
+    const std::vector<std::tuple<size_t, std::optional<std::string>>>&
+        rowIndexColumns = {});
 
 void configureReaderOptions(
     dwio::common::ReaderOptions& readerOptions,
@@ -92,6 +94,26 @@ void configureRowReaderOptions(
     const config::ConfigBase* sessionProperties = nullptr);
 
 bool isHiveNull(const std::string& source);
+
+template <TypeKind ToKind>
+bolt::variant convertFromString(const std::optional<std::string>& value) {
+  if (value.has_value()) {
+    if constexpr (ToKind == TypeKind::VARCHAR) {
+      return bolt::variant(value.value());
+    }
+    if constexpr (ToKind == TypeKind::VARBINARY) {
+      return bolt::variant::binary((value.value()));
+    }
+    auto result = bolt::util::Converter<ToKind>::cast(value.value(), nullptr);
+#ifndef SPARK_COMPATIBLE
+    if constexpr (ToKind == TypeKind::TIMESTAMP) {
+      result.toGMT(Timestamp::defaultTimezone());
+    }
+#endif
+    return bolt::variant(result);
+  }
+  return bolt::variant(ToKind);
+}
 
 bool testFilters(
     common::ScanSpec* scanSpec,

@@ -167,6 +167,9 @@ class SelectiveStructColumnReaderBase : public SelectiveColumnReader {
   uint64_t numReads_ = 0;
 
   vector_size_t lazyVectorReadOffset_;
+  // Represents the index of the first row of the current row group, relative to
+  // the start of the file. This is only used in the top-level struct reader.
+  int64_t rowGroupOffset_ = 0;
 
   // Dense set of rows to read in next().
   raw_vector<vector_size_t> rows_;

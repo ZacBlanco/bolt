@@ -239,6 +239,22 @@ HiveDataSource::HiveDataSource(
   }
 
   readerOutputType_ = ROW(std::move(readerRowNames), std::move(readerRowTypes));
+  const auto& names = readerOutputType_->names();
+  const auto readColumnsAsLowercase = hiveConfig_->isFileColumnNamesReadAsLowerCase(
+      connectorQueryCtx_->sessionProperties());
+  // Each element is a pair of column index and column name
+  std::vector<std::tuple<size_t, std::optional<std::string>>> rowIndexColumns;
+  for (int i = 0; i < names.size(); ++i) {
+    const auto& name = names[i];
+    if (paimon::kColumnNameRowIndex == name) {
+      rowIndexColumns.emplace_back(i, std::nullopt);
+    } else if (
+        (!readColumnsAsLowercase && paimon::kColumnNameRowID == name) ||
+        (readColumnsAsLowercase &&
+         boost::algorithm::iequals(paimon::kColumnNameRowID, name))) {
+      rowIndexColumns.emplace_back(i, paimon::kColumnNameRowID);
+    }
+  }
   scanSpec_ = makeScanSpec(
       readerOutputType_,
       subfields,
@@ -248,7 +264,8 @@ HiveDataSource::HiveDataSource(
       infoColumns_,
       pool_,
       expressionEvaluator_,
-      runtimeStats_.get());
+      runtimeStats_.get(),
+      rowIndexColumns);
   if (remainingFilter) {
     bool enableMapSubscriptFilter =
         queryConfig.mapSubscriptFilterPushdownEnabled();
@@ -562,7 +579,7 @@ std::vector<std::string> HiveDataSource::getPaimonSequenceFields(
   }
 
   auto result = splitByComma(sequenceFields);
-  std::string sequenceField = connector::paimon::kSEQUENCE_NUMBER;
+  std::string sequenceField = paimon::kSEQUENCE_NUMBER;
   if (hiveConfig_->isFileColumnNamesReadAsLowerCase(
           connectorQueryCtx_->sessionProperties())) {
     folly::toLowerAscii(sequenceField);
@@ -617,9 +634,19 @@ void HiveDataSource::addSplit(
     splitReader_.reset();
   }
 
+  const auto& tableParameters = hiveTableHandle_->tableParameters();
+  // append-only tables don't need to read additional fields
+  if (tableParameters.find(paimon::kPrimaryKey) == tableParameters.end()) {
+    bolt_USER_CHECK(
+        split->hiveSplits.size() == 1,
+        "Append-only tables should only have a single split");
+    splitReader_ = createConfiguredSplitReader(split->hiveSplits[0], false);
+    return;
+  }
+
   auto fileType = getRowTypeForFile(split);
-  auto& fileColNames = fileType->names();
-  auto& fileColTypes = fileType->children();
+  const auto& fileColNames = fileType->names();
+  const auto& fileColTypes = fileType->children();
 
   auto names = readerOutputType_->names();
   auto types = readerOutputType_->children();
@@ -627,7 +654,6 @@ void HiveDataSource::addSplit(
   std::vector<int> valueIndices(names.size());
   std::iota(valueIndices.begin(), valueIndices.end(), 0);
 
-  const auto& tableParameters = hiveTableHandle_->tableParameters();
   auto primaryKeyNames = getPaimonPrimaryKeys(tableParameters);
   auto primaryKeyIndices = addColumnsIfNotExists(
       names, types, fileColNames, fileColTypes, primaryKeyNames);

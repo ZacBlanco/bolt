@@ -33,6 +33,7 @@
 #include "bolt/connectors/hive/FileHandle.h"
 #include "bolt/connectors/hive/HiveConnectorSplit.h"
 #include "bolt/connectors/hive/HiveSplitReaderBase.h"
+#include "bolt/connectors/hive/PaimonMetadataColumn.h"
 #include "bolt/dwio/common/Options.h"
 namespace bytedance::bolt {
 class BaseVector;
@@ -166,6 +167,8 @@ class SplitReader : public HiveSplitReaderBase {
       bool judgeCache);
 
   uint64_t nextWithPaimonDeletionVector(int64_t size, VectorPtr& output);
+  void populatePaimonMetadataColumns(VectorPtr& output);
+  void computeMetadataColumns();
 
   std::shared_ptr<HiveConnectorSplit> hiveSplit_;
   std::shared_ptr<HiveTableHandle> hiveTableHandle_;
@@ -187,6 +190,10 @@ class SplitReader : public HiveSplitReaderBase {
   std::unique_ptr<bytedance::bolt::paimon::DeletionFileReader>
       paimonDeletionFileReader_;
   BufferPtr paimonDeletionVector_;
+
+  // Map of output index to metadata column type
+  std::unordered_map<size_t, std::shared_ptr<paimon::MetadataColumn>>
+      metadataColumns_{};
 
  private:
   bool emptySplit_;

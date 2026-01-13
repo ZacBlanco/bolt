@@ -52,6 +52,9 @@ ScanSpec& ScanSpec::operator=(const ScanSpec& other) {
     valueHook_ = other.valueHook_;
     isArrayElementOrMapEntry_ = other.isArrayElementOrMapEntry_;
     maxArrayElementsCount_ = other.maxArrayElementsCount_;
+    isRowIndex_ = other.isRowIndex_;
+    rowIndexBase_ = other.rowIndexBase_;
+    rowIndexColumnName_ = other.rowIndexColumnName_;
     expressionEvaluator_ = other.expressionEvaluator_;
     statis_ = other.statis_;
   }
@@ -186,6 +189,9 @@ void ScanSpec::moveAdaptationFrom(ScanSpec& other) {
           // received.
           child->filter_ = std::move(otherChild->filter_);
           child->selectivity_ = otherChild->selectivity_;
+          child->isRowIndex_ = otherChild->isRowIndex_;
+          child->rowIndexBase_ = otherChild->rowIndexBase_;
+          child->rowIndexColumnName_ = otherChild->rowIndexColumnName_;
         }
         childByFieldName_[child->fieldName_] = child.get();
         newChildren.push_back(std::move(child));

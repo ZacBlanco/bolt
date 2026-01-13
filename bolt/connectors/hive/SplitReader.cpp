@@ -33,8 +33,11 @@
 
 #include "bolt/common/caching/CacheTTLController.h"
 #include "bolt/connectors/hive/HiveConfig.h"
+#include "bolt/connectors/hive/HiveConfig.h"
 #include "bolt/connectors/hive/HiveConnectorSplit.h"
 #include "bolt/connectors/hive/HiveConnectorUtil.h"
+#include "bolt/connectors/hive/PaimonConstants.h"
+#include "bolt/connectors/hive/PaimonMetadataColumn.h"
 #include "bolt/connectors/hive/TableHandle.h"
 #include "bolt/dwio/common/ReaderFactory.h"
 #include "bolt/dwio/paimon/deletionvectors/DeletionFileReader.h"
@@ -105,26 +108,6 @@ bool applyPartitionFilter(
   }
 }
 
-template <TypeKind ToKind>
-bolt::variant convertFromString(const std::optional<std::string>& value) {
-  if (value.has_value()) {
-    if constexpr (ToKind == TypeKind::VARCHAR) {
-      return bolt::variant(value.value());
-    }
-    if constexpr (ToKind == TypeKind::VARBINARY) {
-      return bolt::variant::binary((value.value()));
-    }
-    auto result = bolt::util::Converter<ToKind>::cast(value.value(), nullptr);
-#ifndef SPARK_COMPATIBLE
-    if constexpr (ToKind == TypeKind::TIMESTAMP) {
-      result.toGMT(Timestamp::defaultTimezone());
-    }
-#endif
-    return bolt::variant(result);
-  }
-  return bolt::variant(ToKind);
-}
-
 } // namespace
 
 std::unique_ptr<SplitReader> SplitReader::create(
@@ -186,9 +169,73 @@ SplitReader::SplitReader(
         "{} reader does not support filter pushdown yet!",
         hiveSplit->fileFormat);
   }
+  computeMetadataColumns();
 }
 
 SplitReader::~SplitReader() = default;
+
+void SplitReader::computeMetadataColumns() {
+  auto isReadAsLowercase = hiveConfig_->isFileColumnNamesReadAsLowerCase(
+      connectorQueryCtx_->sessionProperties());
+  std::string rowIdColumnName = paimon::kColumnNameRowID;
+  std::string sequenceNumberColumnName = paimon::kSEQUENCE_NUMBER;
+  if (isReadAsLowercase) {
+    folly::toLowerAscii(rowIdColumnName);
+    folly::toLowerAscii(sequenceNumberColumnName);
+  }
+  if (scanSpec_->childByName(rowIdColumnName) != nullptr) {
+    const auto& firstRowIDIter =
+        hiveSplit_->customSplitInfo.find(paimon::kFileMetaFirstRowID);
+    if (firstRowIDIter != hiveSplit_->customSplitInfo.end()) {
+      char* end;
+      const auto firstRowID =
+          std::strtol(firstRowIDIter->second.c_str(), &end, 10);
+      bolt_CHECK_NE(
+          end,
+          nullptr,
+          "Failed to convert _FIRST_ROW_ID {} to long",
+          firstRowIDIter->second);
+      auto* const rowIDChildSpec = scanSpec_->childByName(rowIdColumnName);
+      rowIDChildSpec->setRowIndexBase(firstRowID);
+    }
+  }
+
+  const auto& children = readerOutputType_->names();
+  for (auto i = 0; i < children.size(); ++i) {
+    const auto& name = children[i];
+    if (paimon::kColumnNameFilePath == name) {
+      metadataColumns_[i] = std::make_shared<paimon::MetadataColumnFilePath>(
+          hiveSplit_->filePath);
+    } else if (paimon::kColumnNameBucket == name) {
+      bolt_CHECK(
+          hiveSplit_->tableBucketNumber.has_value(),
+          "Bucket value is not set when paimon bucket column is requested");
+      metadataColumns_[i] = std::make_shared<paimon::MetadataColumnBucket>(
+          hiveSplit_->tableBucketNumber.value());
+    } else if (paimon::kColumnNamePartition == name) {
+      auto partType = readerOutputType_->childAt(i);
+      metadataColumns_[i] = std::make_shared<paimon::MetadataColumnPartition>(
+          partType, hiveSplit_->partitionKeys, pool_);
+    } else if (sequenceNumberColumnName == name) {
+      auto maxSequenceNumberIter =
+          hiveSplit_->customSplitInfo.find(paimon::kFileMetaMaxSequenceNumber);
+      if (maxSequenceNumberIter == hiveSplit_->customSplitInfo.end()) {
+        continue;
+      }
+      char* end;
+      auto maxSequenceNumber =
+          std::strtol(maxSequenceNumberIter->second.c_str(), &end, 10);
+      bolt_CHECK_NE(
+          end,
+          nullptr,
+          "Failed to convert _MAX_SEQUENCE_NUMBER {} to long",
+          maxSequenceNumberIter->second);
+      metadataColumns_[i] =
+          std::make_shared<paimon::MetadataColumnSequenceNumber>(
+              maxSequenceNumber);
+    }
+  }
+}
 
 void SplitReader::configureReaderOptions() {
   hive::configureReaderOptions(
@@ -298,11 +345,20 @@ std::vector<TypePtr> SplitReader::adaptColumns(
             partitionValue->at(0) == '~' && fileType->containsChild(fieldName));
       };
 
-  auto& childrenSpecs = scanSpec_->children();
+  const auto& childrenSpecs = scanSpec_->children();
   for (size_t i = 0; i < childrenSpecs.size(); ++i) {
     auto* childSpec = childrenSpecs[i].get();
     const std::string& fieldName = childSpec->fieldName();
-
+    const auto readerOutputIdx =
+        readerOutputType_->getChildIdxIfExists(fieldName);
+    const auto& metadataColumn = readerOutputIdx.has_value()
+        ? metadataColumns_.find(readerOutputIdx.value())
+        : metadataColumns_.end();
+    std::string sequenceNumberColumnName = paimon::kSEQUENCE_NUMBER;
+    if (hiveConfig_->isFileColumnNamesReadAsLowerCase(
+            connectorQueryCtx_->sessionProperties())) {
+      folly::toLowerAscii(sequenceNumberColumnName);
+    }
     auto iter = hiveSplit_->partitionKeys.find(fieldName);
     if (iter != hiveSplit_->partitionKeys.end()) {
       if (isRangePartitionColumn(fieldName, iter->second)) {
@@ -349,6 +405,18 @@ std::vector<TypePtr> SplitReader::adaptColumns(
             std::move(bucket));
         childSpec->setConstantValue(constantVec);
       }
+    } else if (
+        metadataColumn != metadataColumns_.end() &&
+        !(sequenceNumberColumnName == childSpec->fieldName() &&
+          fileType->containsChild(sequenceNumberColumnName))) {
+      // if column is sequence number, check that it's in the file
+      // if it is in the file, we can skip this section and read it directly.
+      // otherwise, set it as a constant.
+      const auto& [idx, column] = *metadataColumn;
+      auto baseVec = BaseVector::create(
+          column->type(), 1, connectorQueryCtx_->memoryPool());
+      column->populateVector(baseVec);
+      childSpec->setConstantValue(baseVec);
     } else if (auto iter = hiveSplit_->infoColumns.find(fieldName);
                iter != hiveSplit_->infoColumns.end()) {
       auto infoColumnType =
@@ -434,10 +502,11 @@ void SplitReader::checkAndCreatePaimonDeletionFileReader(
       judgeCache,
       columnCacheBlackList,
       nullptr);
-  paimon::DeletionFileReader::Options deletionFileReaderOptions{
+  bolt::paimon::DeletionFileReader::Options deletionFileReaderOptions{
       .offset = binOffset, .size = binSize, .memoryPool = pool_};
-  paimonDeletionFileReader_ = std::make_unique<paimon::DeletionFileReader>(
-      std::move(deleteFileInput), deletionFileReaderOptions);
+  paimonDeletionFileReader_ =
+      std::make_unique<bolt::paimon::DeletionFileReader>(
+          std::move(deleteFileInput), deletionFileReaderOptions);
 }
 
 uint64_t SplitReader::nextWithPaimonDeletionVector(
@@ -456,10 +525,27 @@ uint64_t SplitReader::nextWithPaimonDeletionVector(
 }
 
 uint64_t SplitReader::next(int64_t size, VectorPtr& output) {
+  uint64_t rows;
   if (paimonDeletionFileReader_) {
-    return nextWithPaimonDeletionVector(size, output);
+    rows = nextWithPaimonDeletionVector(size, output);
+  } else {
+    rows = baseRowReader_->next(size, output);
   }
-  return baseRowReader_->next(size, output);
+  populatePaimonMetadataColumns(output);
+  return rows;
+}
+
+// Adds constant metadata columns into the result.
+// Paimon splits are made of multiple hive splits, but they all share the same
+// scanSpec reference. The scanSpec constants are overwritten when there are
+// multiple hive splits in a paimon split. Calling this function will correctly
+// populate the output with the metadata columns for this particular split.
+void SplitReader::populatePaimonMetadataColumns(VectorPtr& output) {
+  if (isPartOfPaimonSplit_) {
+    for (const auto& [idx, metadataColumn] : metadataColumns_) {
+      metadataColumn->populateVector(output->as<RowVector>()->childAt(idx));
+    }
+  }
 }
 
 void SplitReader::resetFilterCaches() {

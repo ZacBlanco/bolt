@@ -19,16 +19,26 @@
 #include <stdint.h>
 namespace bytedance::bolt::connector::paimon {
 
+static constexpr const char* kColumnNameRowIndex = "__paimon_row_index";
+static constexpr const char* kColumnNameFilePath = "__paimon_file_path";
+static constexpr const char* kColumnNamePartition = "__paimon_partition";
+static constexpr const char* kColumnNameBucket = "__paimon_bucket";
+static constexpr const char* kColumnNameRowID = "_ROW_ID";
 static constexpr const char* kSEQUENCE_NUMBER = "_SEQUENCE_NUMBER";
 static constexpr const char* kVALUE_KIND = "_VALUE_KIND";
 static constexpr const char* kKEY_FIELD_PREFIX = "_KEY_";
 static constexpr uint32_t kMAX_BATCH_SIZE = 1024;
+
+static constexpr const char* kFileMetaFirstRowID = "_FIRST_ROW_ID";
+static constexpr const char* kFileMetaMaxSequenceNumber =
+    "_MAX_SEQUENCE_NUMBER";
 
 static constexpr const char* kPrimaryKey = "primary-key";
 static constexpr const char* kSequenceField = "sequence.field";
 static constexpr const char* kRowKindField = "rowkind.field";
 static constexpr const char* kMergeEngine = "merge-engine";
 static constexpr const char* kDeduplicateMergeEngine = "deduplicate";
+static constexpr const char* kRowTrackingEnabled = "row-tracking.enabled";
 static constexpr const char* kPartialUpdateMergeEngine = "partial-update";
 static constexpr const char* kAggregateMergeEngine = "aggregation";
 static constexpr const char* kFirstRowMergeEngine = "first-row";

@@ -114,7 +114,7 @@ class ScanSpec {
   }
 
   void setConstantValue(VectorPtr value) {
-    constantValue_ = value;
+    constantValue_ = std::move(value);
   }
 
   bool isConstant() const {
@@ -361,6 +361,34 @@ class ScanSpec {
     logicalTypeName_ = name;
   }
 
+  // Whether this spec represents a column for the row index in the file
+  bool isRowIndex() const {
+    return isRowIndex_;
+  }
+
+  // Set whether this column spec represents the row index in the file
+  void setIsRowIndex(bool isRowIndex) {
+    isRowIndex_ = isRowIndex;
+  }
+
+  void setRowIndexColumnName(std::optional<std::string> name) {
+    rowIndexColumnName_ = std::move(name);
+  }
+
+  std::optional<std::string> getRowIndexColumnName() const {
+    return rowIndexColumnName_;
+  }
+
+  // Get the base value which should be added to the generated row index
+  int64_t getRowIndexBase() const {
+    return rowIndexBase_;
+  }
+
+  // Set the base value which should be added to the generated row index
+  void setRowIndexBase(int64_t rowIndexBase) {
+    rowIndexBase_ = rowIndexBase;
+  }
+
  private:
   void reorder();
 
@@ -439,6 +467,19 @@ class ScanSpec {
   // Only take the first maxArrayElementsCount_ elements from each array.
   vector_size_t maxArrayElementsCount_ =
       std::numeric_limits<vector_size_t>::max();
+
+  // Whether this spec represents a column for the row index in the file
+  bool isRowIndex_ = false;
+
+  // Column name of the row index column in the file. During reading, if this
+  // is set, the row index column will be read from the file if it exists.
+  // If not set, the row index column will be synthesized
+  std::optional<std::string> rowIndexColumnName_ = std::nullopt;
+
+  // Base value to be added to the row index. This is used when
+  // rowIndexColumnName_ is not set or the row index column does not exist in
+  // the file.
+  int64_t rowIndexBase_ = 0;
 
   core::ExpressionEvaluator* expressionEvaluator_ = nullptr;
 

@@ -40,6 +40,8 @@ add_library(
   HiveDataSource.cpp
   HivePartitionUtil.cpp
   HiveSplitReaderBase.cpp
+  PaimonMetadataColumn.cpp
+  PaimonSplitReader.cpp
   paimon_merge_engines/AggregateEngine.cpp
   paimon_merge_engines/DeduplicateEngine.cpp
   paimon_merge_engines/PaimonRowKind.cpp

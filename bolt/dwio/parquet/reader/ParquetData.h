@@ -107,7 +107,14 @@ class ParquetData : public dwio::common::FormatData {
         schemaHelper_(schemaHelper),
         enableDictionaryFilter_(enableDictionaryFilter),
         decodeRepDefPageCount_(decodeRepDefPageCount),
-        parquetRepDefMemoryLimit_(parquetRepDefMemoryLimit) {}
+        parquetRepDefMemoryLimit_(parquetRepDefMemoryLimit) {
+    rowGroupOffsets_ = std::vector<int64_t>(rowGroups_.size());
+    rowGroupOffsets_[0] = 0;
+    for (int32_t i = 1; i < rowGroups_.size(); ++i) {
+      rowGroupOffsets_[i] =
+          rowGroupOffsets_[i - 1] + rowGroups_[i - 1].num_rows;
+    }
+  }
 
   /// Prepares to read data for 'index'th row group.
   void enqueueRowGroup(uint32_t index, dwio::common::BufferedInput& input);
@@ -234,6 +241,10 @@ class ParquetData : public dwio::common::FormatData {
     return true;
   }
 
+  int64_t rowGroupOffset(size_t rowGroupIndex) const {
+    return rowGroupOffsets_[rowGroupIndex];
+  }
+
   // Returns the <offset, length> of the row group.
   std::pair<int64_t, int64_t> getRowGroupRegion(uint32_t index) const;
 
@@ -273,6 +284,7 @@ class ParquetData : public dwio::common::FormatData {
   // Streams for this column in each of 'rowGroups_'. Will be created on or
   // ahead of first use, not at construction.
   std::vector<std::unique_ptr<dwio::common::SeekableInputStream>> streams_;
+  std::vector<int64_t> rowGroupOffsets_;
 
   const uint32_t maxDefine_;
   const uint32_t maxRepeat_;

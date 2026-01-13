@@ -42,6 +42,7 @@
 #include "bolt/connectors/hive/PaimonConnectorSplit.h"
 #include "bolt/connectors/hive/PaimonConstants.h"
 #include "bolt/connectors/hive/paimon_merge_engines/PaimonRowKind.h"
+#include "bolt/dwio/paimon/reader/tests/PaimonTestUtils.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
 
 #include <folly/init/Init.h>
@@ -83,69 +84,6 @@ class PaimonReaderAggregateTest : public testing::Test,
     rootPool_.reset();
   }
 
-  RowTypePtr createPaimonFile(
-      std::string outputDirectoryPath,
-      std::shared_ptr<folly::Executor> executor,
-      std::vector<int> primaryKeyIndices,
-      RowTypePtr rowType,
-      std::vector<VectorPtr> data,
-      std::vector<int64_t> sequenceNumber,
-      std::vector<int8_t> valueKind) {
-    std::vector<std::string> names;
-    std::vector<TypePtr> types;
-    std::vector<VectorPtr> fileData;
-
-    const auto& colNames = rowType->names();
-    const auto& colTypes = rowType->children();
-    for (int i : primaryKeyIndices) {
-      names.push_back(connector::paimon::kKEY_FIELD_PREFIX + colNames[i]);
-      types.push_back(colTypes[i]);
-      fileData.push_back(data[i]);
-    }
-
-    auto primaryKeyNames = colNames;
-
-    names.push_back(connector::paimon::kSEQUENCE_NUMBER);
-    types.push_back(BIGINT());
-    fileData.push_back(vectorMaker_.flatVector<int64_t>(sequenceNumber));
-
-    names.push_back(connector::paimon::kVALUE_KIND);
-    types.push_back(TINYINT());
-    fileData.push_back(vectorMaker_.flatVector<int8_t>(valueKind));
-
-    names.insert(names.end(), colNames.begin(), colNames.end());
-    types.insert(types.end(), colTypes.begin(), colTypes.end());
-    fileData.insert(fileData.end(), data.begin(), data.end());
-
-    auto fileRowType =
-        std::make_shared<RowType>(std::move(names), std::move(types));
-
-    auto rowVector = std::make_shared<RowVector>(
-        leafPool_.get(),
-        fileRowType,
-        BufferPtr(nullptr),
-        sequenceNumber.size(),
-        fileData);
-
-    auto writerPlanFragment =
-        exec::test::PlanBuilder()
-            .values({rowVector})
-            .orderBy(primaryKeyNames, false)
-            .tableWrite(outputDirectoryPath, dwio::common::FileFormat::PARQUET)
-            .planFragment();
-
-    auto writeTask = exec::Task::create(
-        "my_write_task",
-        writerPlanFragment,
-        0,
-        core::QueryCtx::create(executor.get()),
-        exec::Task::ExecutionMode::kSerial);
-
-    while (auto result = writeTask->next())
-      ;
-
-    return fileRowType;
-  }
 
   std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
   getIdentityAssignment(RowTypePtr rowType) {
@@ -203,6 +141,8 @@ TEST_F(PaimonReaderAggregateTest, sumNoPrimaryKey) {
        {"f", REAL()},
        {"g", DOUBLE()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -218,6 +158,8 @@ TEST_F(PaimonReaderAggregateTest, sumNoPrimaryKey) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -333,6 +275,8 @@ TEST_F(PaimonReaderAggregateTest, sumWithPrimaryKey) {
        {"f", REAL()},
        {"g", DOUBLE()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -350,6 +294,8 @@ TEST_F(PaimonReaderAggregateTest, sumWithPrimaryKey) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -460,6 +406,8 @@ TEST_F(PaimonReaderAggregateTest, listAgg) {
 
   auto rowType = ROW({{"a", INTEGER()}, {"b", VARCHAR()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -470,6 +418,8 @@ TEST_F(PaimonReaderAggregateTest, listAgg) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -556,6 +506,8 @@ TEST_F(PaimonReaderAggregateTest, listAggDelimiter) {
 
   auto rowType = ROW({{"a", INTEGER()}, {"b", VARCHAR()}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -566,6 +518,8 @@ TEST_F(PaimonReaderAggregateTest, listAggDelimiter) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   auto fileRowType2 = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -659,6 +613,8 @@ TEST_F(PaimonReaderAggregateTest, collectWithPrimaryKey) {
        {"f", ARRAY(REAL())},
        {"g", ARRAY(DOUBLE())}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -674,6 +630,8 @@ TEST_F(PaimonReaderAggregateTest, collectWithPrimaryKey) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -795,6 +753,8 @@ TEST_F(PaimonReaderAggregateTest, collectDistinctWithPrimaryKey) {
        {"f", ARRAY(REAL())},
        {"g", ARRAY(DOUBLE())}});
   auto fileRowType = createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
@@ -810,6 +770,8 @@ TEST_F(PaimonReaderAggregateTest, collectDistinctWithPrimaryKey) {
       {int8_t(PaimonRowKind::INSERT), int8_t(PaimonRowKind::INSERT)});
 
   createPaimonFile(
+      vectorMaker_,
+      leafPool_.get(),
       tempDir->getPath(),
       executor,
       {0},
