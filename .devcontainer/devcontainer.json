@@ -20,13 +20,16 @@
     // Use 'portsAttributes' to set default properties for specific forwarded ports.
     "portsAttributes": {},
     // Use 'remoteEnv' to set environment variables that are only available inside the container.
-    "remoteEnv": {
-    },
+    "remoteEnv": {},
     // Use 'mounts' to make files or directories from your local machine available inside the container.
     "mounts": [
         "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
         "source=conan-cache,target=/home/code/.conan2/p",
         "source=ccache-cache,target=/home/code/.ccache"
+    ],
+    "runArgs": [
+        "--security-opt",
+        "label=disable"
     ],
     // Configure tool-specific properties.
     "features": {}

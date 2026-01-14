@@ -21,7 +21,7 @@ repos:
         types_or: [c++, c]
 
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.24.2
+    rev: v8.30.0
     hooks:
       - id: gitleaks
 
@@ -29,9 +29,8 @@ repos:
     rev: 0.25.1
     hooks:
     - id: gersemi
+      name: Check CMake files
       args: ["--no-warn-about-unknown-commands"]
-
-
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
@@ -46,3 +45,12 @@ repos:
       - id: check-toml
       - id: check-yaml
       - id: check-xml
+
+  - repo: local
+    hooks:
+      -   id: license-header-check
+          name: Check for license headers
+          entry: license-eye header check
+          pass_filenames: false
+          language: golang
+          additional_dependencies: ['github.com/apache/skywalking-eyes/cmd/license-eye@v0.8.0']

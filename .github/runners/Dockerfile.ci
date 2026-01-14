@@ -55,6 +55,8 @@ RUN apt-get update && apt-get install -y \
     less \
     nodejs \
     npm \
+    bsdextrautils \
+    locales \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -73,6 +75,14 @@ RUN https_proxy=${https_proxy} curl -L -# -o /tmp/skywalking-eyes-bin.tgz https:
     sudo tar -C /opt/skywalking-license-eye --strip-components=1 -xzf /tmp/skywalking-eyes-bin.tgz
 
 ENV PATH="/opt/skywalking-license-eye/bin/linux:${PATH}"
+
+RUN export arch=$(arch | sed 's/^aarch64$/arm64/; s/^x86_64$/amd64/') && \
+    export https_proxy=${https_proxy} && \
+    export filename=go1.25.5.linux-${arch}.tar.gz && \
+    curl -L -O --output-dir /tmp https://go.dev/dl/${filename} && \
+    sudo rm -rf /usr/local/bin/go && tar -C /usr/local -xzf /tmp/${filename} && \
+    rm /tmp/${filename}
+ENV PATH="/usr/local/go/bin:${PATH}"
 
 # Set up default python virtualenv, and make it the default on PATH
 RUN virtualenv -p python3 /opt/venv
@@ -116,6 +126,14 @@ os=Linux
 [conf]
 tools.build:compiler_executables={"c": "clang", "cpp": "clang++"}
 EOF
+
+# Generate Locales
+RUN sudo sed -i 's/^# *\(en_US.UTF-8\)/\1/' /etc/locale.gen && \
+    sudo locale-gen && \
+    echo "export LC_ALL=en_US.UTF-8" >> ~/.bashrc && \
+    echo "export LANG=en_US.UTF-8" >> ~/.bashrc && \
+    echo "export LANGUAGE=en_US.UTF-8" >> ~/.bashrc
+
 
 ENV SHELL=/bin/bash
 
