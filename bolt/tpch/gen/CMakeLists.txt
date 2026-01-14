@@ -33,6 +33,24 @@ target_include_directories(bolt_tpch_gen PRIVATE dbgen/include)
 
 target_link_libraries(bolt_tpch_gen bolt_memory bolt_vector bolt_dbgen)
 
+add_executable(bolt_tpch_generate TpchGenerateMain.cpp)
+# Link against generator library and required runtime libs for plan execution and Hive writes.
+target_link_libraries(
+  bolt_tpch_generate
+  bolt_tpch_gen
+  bolt_exec
+  bolt_exec_test_lib
+  bolt_connector
+  bolt_hive_connector
+  bolt_dwio_common
+  bolt_dwio_parquet_reader
+  bolt_memory
+  bolt_type
+  bolt_vector
+  Folly::folly
+  fmt::fmt
+  gflags::gflags)
+
 if(${BOLT_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
