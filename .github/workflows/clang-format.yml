@@ -47,7 +47,7 @@ jobs:
     if: ${{ needs.changes.outputs.source_code == 'true' }}
     runs-on: [ self-hosted, small ]
     container:
-      image: bolt-registry:5000/bolt-ci:20251217
+      image: bolt-registry:5000/bolt-ci:20260114
       options: --user root
     steps:
     - name: Checkout code
