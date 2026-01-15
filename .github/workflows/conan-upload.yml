@@ -42,7 +42,7 @@ jobs:
   upload:
     runs-on: [ self-hosted, medium ]
     container:
-      image: bolt-registry:5000/bolt-ci:20251217
+      image: bolt-registry:5000/bolt-ci:20260114
       options: --user root
       volumes:
         - /data/ccache-data:/data/ccache-data
