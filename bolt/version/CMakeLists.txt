@@ -102,3 +102,4 @@ configure_file(
   "${CMAKE_SOURCE_DIR}/bolt/version/version.h.in" "${OUTPUT_DIR}/version.h"
   @ONLY
 )
+install(FILES "${OUTPUT_DIR}/version.h" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/${REL_PATH}")
