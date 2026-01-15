@@ -172,10 +172,7 @@ else
 endif
 
 ifeq ($(IN_CI), 1)
-	CI_MIN_SIZE_DEBUG ?= True
 	export DEPENDENCY_BUILD_TYPE = Release
-else
-	CI_MIN_SIZE_DEBUG ?= False
 endif
 
 
