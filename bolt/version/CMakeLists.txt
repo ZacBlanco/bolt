@@ -99,6 +99,6 @@ set(OUTPUT_DIR "${CMAKE_BINARY_DIR}/gen_cpp/${REL_PATH}")
 file(MAKE_DIRECTORY ${OUTPUT_DIR})
 # generate version.h
 configure_file(
-  "${CMAKE_SOURCE_DIR}/bolt/version/version.h.in" "${OUTPUT_DIR}/bolt/version/version.h"
+  "${CMAKE_SOURCE_DIR}/bolt/version/version.h.in" "${OUTPUT_DIR}/version.h"
   @ONLY
 )
