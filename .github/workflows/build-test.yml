@@ -111,4 +111,5 @@ jobs:
 
       - name: Bolt build
         run: |
+          echo 'tools.cmake.cmaketoolchain:extra_variables={"CMAKE_CXX_FLAGS_DEBUG": ""}' >> $(conan profile path default)
           make ${{ matrix.build_target }}
