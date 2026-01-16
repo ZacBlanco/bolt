@@ -75,7 +75,7 @@ repos:
           entry: license-eye header check
           language: golang
           pass_filenames: false
-          additional_dependencies: ['github.com/apache/skywalking-eyes/cmd/license-eye@v0.8.0']
+          additional_dependencies: ['github.com/apache/skywalking-eyes/cmd/license-eye@0630b017b4e34f27f0d8719c873d703fb31ec8de']
           args: ["-c", ".licenserc.yaml"]
           exclude: '^\.github/'
           stages: [manual]
