@@ -21,28 +21,17 @@ on:
     branches: [ main ]
 
 jobs:
-  pre-commit:
+  lint:
     runs-on: ['self-hosted', 'small']
     container:
       image: bolt-registry:5000/bolt-ci:20260114
       options: --user root
-    strategy:
-      matrix:
-        hook_id:
-          - clang-format
-          - gersemi
-          - trailing-whitespace
-          - end-of-file-fixer
-          - check-toml
-          - check-yaml
-          - check-xml
-          - license-header-check
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
       - name: Install pre-commit
         run: |
           pip install -r requirements.txt
-      - name: Run ${{ matrix.hook_id }}
+      - name: Run pre-commit hooks
         run: |
-          pre-commit run --all-files ${{ matrix.hook_id }}
+          pre-commit run --all-files
