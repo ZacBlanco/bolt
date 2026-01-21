@@ -171,6 +171,11 @@ else
 	NUM_LINK_JOB ?= $(CI_NUM_LINK_JOB)
 endif
 
+ifeq ($(IN_CI), 1)
+	export DEPENDENCY_BUILD_TYPE = Release
+endif
+
+
 CPU_TARGET ?= "avx"
 
 ifeq ($(UNAME_S),Darwin)
@@ -224,8 +229,6 @@ conan_build:
 	fi; \
 	git rev-parse HEAD && \
 	mkdir -p _build/${BUILD_TYPE} && \
-	rm -f _build/${BUILD_TYPE}/CMakeCache.txt && \
-	echo ${BUILD_TYPE} > _build/.build_type && \
 	cd _build/${BUILD_TYPE} && \
 	echo " -o bolt/*:enable_hdfs=${ENABLE_HDFS} \
 	-o bolt/*:use_arrow_hdfs=${USE_ARROW_HDFS} \
@@ -239,22 +242,41 @@ conan_build:
 	-o bolt/*:ldb_build=${LDB_BUILD} \
 	-o bolt/*:enable_crc=${ENABLE_CRC} \
 	-pr ${PROFILE} -pr ../../scripts/conan/bolt.profile \
-	${CONAN_OPTIONS}" > conan.options && \
+	${CONAN_OPTIONS}" > new_conan.options && \
+	set -x && \
+	if [ -f conan.options ] && [ -f ../.build_type ] && cmp -s new_conan.options conan.options && [ "`cat ../.build_type`" = "${BUILD_TYPE}" ]; then \
+	  echo "Conan options and build type unchanged; preserving CMakeCache.txt"; \
+	else \
+	  echo "Conan options and build type changed! deleting CMakeCache.txt"; \
+	  rm -f CMakeCache.txt; \
+	fi && \
+	mv new_conan.options conan.options && \
+	echo ${BUILD_TYPE} > ../.build_type && \
 	read ALL_CONAN_OPTIONS < conan.options && \
 	conan graph info ../.. $${ALL_CONAN_OPTIONS} --format=html > bolt.conan.graph.html  && \
 	export NUM_LINK_JOB=$(NUM_LINK_JOB) && \
 	conan install ../.. --name=bolt --version=${BUILD_VERSION} --user=${BUILD_USER} --channel=${BUILD_CHANNEL} \
-	   -s llvm-core/*:build_type=Release -s build_type=${BUILD_TYPE} $${ALL_CONAN_OPTIONS} --build=missing && \
+	   -s llvm-core/*:build_type=Release \
+	   -s "&:build_type=${BUILD_TYPE}" \
+	   -s build_type=$${DEPENDENCY_BUILD_TYPE:-${BUILD_TYPE}} \
+	$${ALL_CONAN_OPTIONS} --build=missing && \
 	NUM_THREADS=$(NUM_THREADS) \
 	conan build ../.. --name=bolt --version=${BUILD_VERSION} --user=${BUILD_USER} --channel=${BUILD_CHANNEL} \
-	   -s llvm-core/*:build_type=Release -s build_type=${BUILD_TYPE} --build=missing $${ALL_CONAN_OPTIONS} && \
+	   -s llvm-core/*:build_type=Release \
+	   -s "&:build_type=${BUILD_TYPE}" \
+	   -s build_type=$${DEPENDENCY_BUILD_TYPE:-${BUILD_TYPE}} \
+	   --build=missing $${ALL_CONAN_OPTIONS} && \
 	cd -
 
 export_base:
 	cd _build/${BUILD_TYPE} && \
 	read ALL_CONAN_OPTIONS < conan.options && \
 	conan export-pkg --name=bolt --version=${BUILD_VERSION} --user=${BUILD_USER} --channel=${BUILD_CHANNEL} \
-	 $${ALL_CONAN_OPTIONS} -s llvm-core/*:build_type=Release -s build_type=${BUILD_TYPE} ../.. && \
+	 $${ALL_CONAN_OPTIONS} \
+	 -s llvm-core/*:build_type=Release \
+	 -s "&:build_type=${BUILD_TYPE}" \
+	 -s build_type=$${DEPENDENCY_BUILD_TYPE:-${BUILD_TYPE}} \
+	 ../.. && \
 	cd -
 
 export_debug:
@@ -330,6 +352,7 @@ benchmarks-duckdb-build:
 
 # skip all hdfs test
 # skip TimestampWithTimezone register and test
+unittest_debug: unittest
 unittest: debug_with_test			#: Build with debugging and run unit tests
 	ctest --test-dir $(BUILD_BASE_DIR)/Debug --timeout 7200 -j $(NUM_THREADS) --output-on-failure
 

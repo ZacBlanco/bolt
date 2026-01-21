@@ -32,6 +32,7 @@ env:
   CCACHE_DIR: /data/ccache-data
   CCACHE_MAX_SIZE: '100G'
   CI_NUM_THREADS: "16"
+  IN_CI: '1'
 
 jobs:
   changes:
@@ -51,6 +52,7 @@ jobs:
               - 'CMakeLists.txt'
               - 'bolt/**/CMakeLists.txt'
               - 'scripts/**'
+              - '.github/workflows/**'
   build-test:
     needs: changes
     if: ${{ needs.changes.outputs.source_code == 'true' }}
@@ -83,7 +85,7 @@ jobs:
       run: |
         make unittest_${{ matrix.build_type }}
 
-  benchmarks-build:
+  build-only:
       needs: changes
       if: ${{ needs.changes.outputs.source_code == 'true' }}
       runs-on: [ self-hosted, medium ]
@@ -97,6 +99,9 @@ jobs:
           image: bolt-registry:5000/conan-server:latest
           volumes:
             - /data/conan-server-data:/var/conan/data
+      strategy:
+        matrix:
+          build_target: [ benchmarks-build, debug_with_test ]
       steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -106,4 +111,5 @@ jobs:
 
       - name: Bolt build
         run: |
-          make benchmarks-build
+          echo 'tools.cmake.cmaketoolchain:extra_variables={"CMAKE_CXX_FLAGS_DEBUG": ""}' >> $(conan profile path default)
+          make ${{ matrix.build_target }}
