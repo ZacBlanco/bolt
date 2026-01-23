@@ -26,6 +26,7 @@ concurrency:
 
 env:
   PRE_COMMIT_HOME: /data/pre-commit-cache
+  GOMAXPROCS: 8
 
 jobs:
   lint:

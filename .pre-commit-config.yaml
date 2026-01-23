@@ -67,7 +67,6 @@ repos:
           entry: go run -C .github/license_check check_license.go
           language: golang
           pass_filenames: true
-          exclude: '^\.github/'
       - id: clang-tidy
         name: clang-tidy
         description: >-
