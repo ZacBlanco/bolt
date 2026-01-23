@@ -60,25 +60,14 @@ repos:
     hooks:
       - id: shfmt
         args: ["-w", "-i", "2", "-bn", "-ci", "-sr"]
-
   - repo: local
     hooks:
-      -   id: license-header-check-commit
-          name: Check for license headers (Changed files only)
+      -   id: license-header-check
+          name: Check for license headers
           entry: go run -C .github/license_check check_license.go
           language: golang
           pass_filenames: true
-          additional_dependencies: ['github.com/apache/skywalking-eyes/cmd/license-eye@v0.8.0']
           exclude: '^\.github/'
-      -   id: license-header-check-all
-          name: Check for license headers (All files)
-          entry: license-eye header check
-          language: golang
-          pass_filenames: false
-          additional_dependencies: ['github.com/apache/skywalking-eyes/cmd/license-eye@0630b017b4e34f27f0d8719c873d703fb31ec8de']
-          args: ["-c", ".licenserc.yaml"]
-          exclude: '^\.github/'
-          stages: [manual]
       - id: clang-tidy
         name: clang-tidy
         description: >-
