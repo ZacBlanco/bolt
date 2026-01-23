@@ -24,6 +24,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  PRE_COMMIT_HOME: /data/pre-commit-cache
+
 jobs:
   lint:
     runs-on: ['self-hosted', 'small']
@@ -31,7 +34,7 @@ jobs:
       image: bolt-registry:5000/bolt-ci:20260114
       options: --user root
       volumes:
-        - /root/.cache:/root/.cache
+        - pre-commit-cache:/data/pre-commit-cache
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
