@@ -63,7 +63,10 @@ func main() {
 		os.Exit(1)
 	}
 	// move up to project root
-	os.Chdir("../../")
+	if err := os.Chdir("../../"); err != nil {
+		fmt.Printf("[ERROR] Failed to change dir to project root: %v\n", err)
+		os.Exit(1)
+	}
 
 	licenseHeaderConfig := config.Headers()[0]
 
