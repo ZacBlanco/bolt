@@ -15,7 +15,7 @@
 
 module license_check
 
-go 1.20
+go 1.25.3
 
 require (
 	github.com/apache/skywalking-eyes v0.8.1-0.20260115163815-0630b017b4e3
