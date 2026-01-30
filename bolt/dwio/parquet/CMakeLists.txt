@@ -27,6 +27,7 @@
 
 if(BOLT_ENABLE_PARQUET)
   add_subdirectory(thrift)
+  add_subdirectory(encryption)
   add_subdirectory(reader)
   add_subdirectory(arrow)
   add_subdirectory(writer)

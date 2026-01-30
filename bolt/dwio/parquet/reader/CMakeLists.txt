@@ -55,6 +55,7 @@ target_link_libraries(
   bolt_type
   bolt_dwio_common
   bolt_type
+  bolt_dwio_parquet_encryption
   fmt::fmt
   arrow::arrow
   Snappy::snappy

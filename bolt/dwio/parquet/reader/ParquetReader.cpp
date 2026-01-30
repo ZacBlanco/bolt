@@ -35,11 +35,13 @@
 #include <cstdint>
 #include "bolt/dwio/common/CachedBufferedInput.h"
 #include "bolt/dwio/common/Options.h"
+#include "bolt/dwio/parquet/encryption/KmsClient.h"
 #include "bolt/dwio/parquet/reader/ParquetColumnReader.h"
 #include "bolt/dwio/parquet/reader/ParquetFooterCache.h"
 #include "bolt/dwio/parquet/reader/SchemaHelper.h"
 #include "bolt/dwio/parquet/reader/StructColumnReader.h"
 #include "bolt/dwio/parquet/thrift/FmtParquetFormatters.h"
+#include "bolt/dwio/parquet/thrift/ThriftInternal.h"
 #include "bolt/dwio/parquet/thrift/ThriftTransport.h"
 #include "bolt/dwio/parquet/thrift/codegen/parquet_types.h"
 
@@ -47,6 +49,27 @@ namespace bytedance::bolt::parquet {
 
 constexpr std::string_view kDcmapColPrefix =
     "parquet.meta.dynamic.column.map.keys.of.";
+
+namespace {
+::parquet::EncryptionAlgorithm FromThrift(
+    const thrift::EncryptionAlgorithm& encryption) {
+  ::parquet::EncryptionAlgorithm algo;
+  if (encryption.__isset.AES_GCM_V1) {
+    algo.algorithm = ::parquet::ParquetCipher::AES_GCM_V1;
+    algo.aad = ::parquet::AadMetadata{
+        encryption.AES_GCM_V1.aad_prefix,
+        encryption.AES_GCM_V1.aad_file_unique,
+        encryption.AES_GCM_V1.supply_aad_prefix};
+  } else {
+    algo.algorithm = ::parquet::ParquetCipher::AES_GCM_CTR_V1;
+    algo.aad = ::parquet::AadMetadata{
+        encryption.AES_GCM_CTR_V1.aad_prefix,
+        encryption.AES_GCM_CTR_V1.aad_file_unique,
+        encryption.AES_GCM_CTR_V1.supply_aad_prefix};
+  }
+  return algo;
+}
+} // namespace
 
 /// Metadata and options for reading Parquet.
 class ReaderBase {
@@ -71,6 +94,10 @@ class ReaderBase {
 
   const thrift::FileMetaData& thriftFileMetaData() const {
     return *fileMetaData_;
+  }
+
+  const std::shared_ptr<InternalFileDecryptor>& fileDecryptor() const {
+    return fileDecryptor_;
   }
 
   FileMetaDataPtr fileMetaData() const {
@@ -145,6 +172,15 @@ class ReaderBase {
           children,
       bool fileColumnNamesReadAsLowerCase);
 
+  uint32_t parseEncryptedFooter(
+      const char* cryptoMetadataBuffer,
+      uint32_t footerLen);
+  void parsePlainFooter();
+  std::string HandleAadPrefix(
+      const std::shared_ptr<::parquet::FileDecryptionProperties>&
+          fileDecryptionProperties,
+      ::parquet::EncryptionAlgorithm& algo);
+
   memory::MemoryPool& pool_;
   const uint64_t footerEstimatedSize_;
   const uint64_t filePreloadThreshold_;
@@ -162,6 +198,12 @@ class ReaderBase {
   // Map from row group index to pre-created loading BufferedInput.
   std::unordered_map<uint32_t, std::shared_ptr<dwio::common::BufferedInput>>
       inputs_;
+
+  std::shared_ptr<::parquet::encryption::CryptoFactory> cryptoFactory_;
+
+  std::shared_ptr<::parquet::FileDecryptionProperties>
+      fileDecryptionProperties_;
+  std::shared_ptr<InternalFileDecryptor> fileDecryptor_;
 
   void collectLogicalTypes(
       const std::shared_ptr<const dwio::common::TypeWithId>& type,
@@ -204,6 +246,7 @@ void ReaderBase::loadFileMetaData() {
     auto entry = cache->get(input_->getReadFile()->getName());
     if (entry.has_value()) {
       fileMetaData_ = std::move(entry.value());
+      parsePlainFooter();
       return;
     }
   }
@@ -222,8 +265,11 @@ void ReaderBase::loadFileMetaData() {
   dwio::common::readBytes(
       readSize, stream.get(), copy.data(), bufferStart, bufferEnd);
   BOLT_CHECK(
-      strncmp(copy.data() + readSize - 4, "PAR1", 4) == 0,
+      strncmp(copy.data() + readSize - 4, "PAR1", 4) == 0 ||
+          strncmp(copy.data() + readSize - 4, "PARE", 4) == 0,
       "No magic bytes found at end of the Parquet file");
+  const bool isEncryptedFooter =
+      strncmp(copy.data() + readSize - 4, "PARE", 4) == 0;
 
   uint32_t footerLength =
       *(reinterpret_cast<const uint32_t*>(copy.data() + readSize - 8));
@@ -244,14 +290,52 @@ void ReaderBase::loadFileMetaData() {
         missingLength, stream.get(), copy.data(), bufferStart, bufferEnd);
   }
 
+  char* fileMetadataBuffer = copy.data() + footerOffsetInBuffer;
+  uint32_t fileMetadataLen = footerLength;
+  std::vector<char> decryptedBuffer;
+
+  if (isEncryptedFooter) {
+    // Encrypted file with Encrypted footer.
+    uint32_t cryptoMetadataLen =
+        parseEncryptedFooter(copy.data() + footerOffsetInBuffer, footerLength);
+    // Read the actual footer
+    footerOffsetInBuffer += cryptoMetadataLen;
+    footerLength -= cryptoMetadataLen;
+    auto decryptor = fileDecryptor_->GetFooterDecryptor();
+    decryptedBuffer.resize(footerLength - decryptor->CiphertextSizeDelta());
+    int32_t decryptedBufferLen = decryptor->Decrypt(
+        reinterpret_cast<uint8_t*>(copy.data() + footerOffsetInBuffer),
+        0,
+        reinterpret_cast<uint8_t*>(decryptedBuffer.data()),
+        decryptedBuffer.size());
+    if (decryptedBufferLen <= 0) {
+      BOLT_FAIL("Couldn't decrypt footer buffer");
+    }
+    fileMetadataBuffer = decryptedBuffer.data();
+    fileMetadataLen = decryptedBufferLen;
+  }
+
   std::shared_ptr<thrift::ThriftTransport> thriftTransport =
       std::make_shared<thrift::ThriftBufferedTransport>(
-          copy.data() + footerOffsetInBuffer, footerLength);
+          fileMetadataBuffer, fileMetadataLen);
   auto thriftProtocol = std::make_unique<
       apache::thrift::protocol::TCompactProtocolT<thrift::ThriftTransport>>(
       thriftTransport);
   fileMetaData_ = std::make_shared<thrift::FileMetaData>();
   fileMetaData_->read(thriftProtocol.get());
+
+  if (isEncryptedFooter) {
+    return;
+  } else if (!fileMetaData_->__isset.encryption_algorithm) {
+    if (fileDecryptionProperties_ != nullptr) {
+      if (!fileDecryptionProperties_->plaintext_files_allowed()) {
+        BOLT_FAIL("Applying decryption properties on plaintext file");
+      }
+    }
+  } else {
+    // Encrypted file with plaintext footer mode.
+    parsePlainFooter();
+  }
 
   if (auto* cache = ParquetFooterCache::getInstance()) {
     cache->add(input_->getReadFile()->getName(), fileMetaData_, footerLength);
@@ -259,9 +343,6 @@ void ReaderBase::loadFileMetaData() {
 }
 
 void ReaderBase::initializeSchema() {
-  if (fileMetaData_->__isset.encryption_algorithm) {
-    BOLT_UNSUPPORTED("Encrypted Parquet files are not supported");
-  }
   BOLT_CHECK_GT(
       fileMetaData_->schema.size(),
       1,
@@ -989,6 +1070,128 @@ bool ReaderBase::isRowGroupBuffered(int32_t rowGroupIndex) const {
   return inputs_.count(rowGroupIndex) != 0;
 }
 
+uint32_t ReaderBase::parseEncryptedFooter(
+    const char* cryptoMetadataBuffer,
+    uint32_t footerLen) {
+  auto cryptoMetadataLen = footerLen;
+  thrift::FileCryptoMetaData fileCryptoMetadata;
+  thrift::ThriftDeserializer deserializer;
+  deserializer.DeserializeUnencryptedMessage(
+      reinterpret_cast<const uint8_t*>(cryptoMetadataBuffer),
+      &cryptoMetadataLen,
+      &fileCryptoMetadata);
+
+  // Add KMS metadata to retrieve the key. Since the implementation of the
+  // KMS client varies among different KMS systems, we leave a base KMS
+  // client class here. You can implement your own KMS client.
+
+  cryptoFactory_ = std::make_shared<::parquet::encryption::CryptoFactory>();
+
+  std::shared_ptr<KmsClientFactory> kmsClientFactory =
+      std::make_shared<KmsClientFactory>();
+
+  std::shared_ptr<KmsConfBuilder> kmsConfBuilder =
+      std::make_shared<KmsConfBuilder>(fileCryptoMetadata.key_metadata);
+
+  ::parquet::encryption::KmsConnectionConfig kmsConf = kmsConfBuilder->build();
+  ::parquet::encryption::DecryptionConfiguration decryptionConf =
+      ::parquet::encryption::DecryptionConfiguration();
+
+  cryptoFactory_->RegisterKmsClientFactory(std::move(kmsClientFactory));
+
+  fileDecryptionProperties_ =
+      cryptoFactory_->GetFileDecryptionProperties(kmsConf, decryptionConf);
+
+  thrift::EncryptionAlgorithm encryption =
+      fileCryptoMetadata.encryption_algorithm;
+  ::parquet::EncryptionAlgorithm algo = FromThrift(encryption);
+  std::string fileAad = HandleAadPrefix(fileDecryptionProperties_, algo);
+  fileDecryptor_ = std::make_shared<InternalFileDecryptor>(
+      fileDecryptionProperties_.get(),
+      fileAad,
+      algo.algorithm == ::parquet::ParquetCipher::type::AES_GCM_V1
+          ? ParquetCipher::type::AES_GCM_V1
+          : ParquetCipher::type::AES_GCM_CTR_V1,
+      fileCryptoMetadata.key_metadata,
+      &getMemoryPool());
+  return cryptoMetadataLen;
+}
+
+std::string ReaderBase::HandleAadPrefix(
+    const std::shared_ptr<::parquet::FileDecryptionProperties>&
+        fileDecryptionProperties,
+    ::parquet::EncryptionAlgorithm& algo) {
+  std::string aadPrefixInProperties = fileDecryptionProperties->aad_prefix();
+  std::string aadPrefix = aadPrefixInProperties;
+  bool fileHasAadPrefix = algo.aad.aad_prefix.empty() ? false : true;
+  std::string aadPrefixInFile = algo.aad.aad_prefix;
+  if (algo.aad.supply_aad_prefix && aadPrefixInProperties.empty()) {
+    BOLT_FAIL(
+        "AAD prefix used for file encryption, but not stored in file and not supplied in decryption properties");
+  }
+  if (fileHasAadPrefix) {
+    if (!aadPrefixInProperties.empty()) {
+      if (aadPrefixInProperties.compare(aadPrefixInFile) != 0) {
+        BOLT_FAIL("AAD Prefix in file and in properties is not the same");
+      }
+    }
+    aadPrefix = aadPrefixInFile;
+    const std::shared_ptr<::parquet::AADPrefixVerifier>& aadPrefixVerifier =
+        fileDecryptionProperties->aad_prefix_verifier();
+    if (aadPrefixVerifier != nullptr) {
+      aadPrefixVerifier->Verify(aadPrefix);
+    }
+  } else {
+    if (!algo.aad.supply_aad_prefix && !aadPrefixInProperties.empty()) {
+      BOLT_FAIL(
+          "AAD Prefix set in decryption properties, but was not used for file encryption");
+    }
+    const std::shared_ptr<::parquet::AADPrefixVerifier>& aadPrefixVerifier =
+        fileDecryptionProperties->aad_prefix_verifier();
+    if (aadPrefixVerifier != nullptr) {
+      BOLT_FAIL("AAD Prefix Verifier is set, but AAD Prefix not found in file");
+    }
+  }
+  return aadPrefix + algo.aad.aad_file_unique;
+}
+
+// Parse plain footers in Encrypted Parquet files.
+void ReaderBase::parsePlainFooter() {
+  // Providing decryption properties in plaintext footer mode is not
+  // mandatory, for example when reading by legacy reader.
+  auto* file_decryption_properties = fileDecryptionProperties_.get();
+  if (file_decryption_properties != nullptr) {
+    thrift::EncryptionAlgorithm& thriftAlgo =
+        fileMetaData_->encryption_algorithm;
+    ::parquet::EncryptionAlgorithm algo;
+    ParquetCipher::type algorithmType = ParquetCipher::type::AES_GCM_V1;
+    // from thrift algo to arrow parquet EncryptionAlgorithm
+    if (thriftAlgo.__isset.AES_GCM_V1) {
+      algo.algorithm = ::parquet::ParquetCipher::type::AES_GCM_V1;
+      algo.aad.aad_prefix = thriftAlgo.AES_GCM_V1.aad_prefix;
+      algo.aad.aad_file_unique = thriftAlgo.AES_GCM_V1.aad_file_unique;
+      algo.aad.supply_aad_prefix = thriftAlgo.AES_GCM_V1.supply_aad_prefix;
+    } else if (thriftAlgo.__isset.AES_GCM_CTR_V1) {
+      algorithmType = ParquetCipher::type::AES_GCM_CTR_V1;
+      algo.algorithm = ::parquet::ParquetCipher::type::AES_GCM_CTR_V1;
+      algo.aad.aad_prefix = thriftAlgo.AES_GCM_CTR_V1.aad_prefix;
+      algo.aad.aad_file_unique = thriftAlgo.AES_GCM_CTR_V1.aad_file_unique;
+      algo.aad.supply_aad_prefix = thriftAlgo.AES_GCM_CTR_V1.supply_aad_prefix;
+    } else {
+      BOLT_FAIL("ParquetCipher::type not specified");
+    }
+    // Handle AAD prefix
+    std::string file_aad = HandleAadPrefix(fileDecryptionProperties_, algo);
+    fileDecryptor_ = std::make_shared<InternalFileDecryptor>(
+        file_decryption_properties,
+        file_aad,
+        algorithmType,
+        fileMetaData_->footer_signing_key_metadata,
+        &pool_);
+    // TODO : check_plaintext_footer_integrity
+  }
+}
+
 namespace {
 struct ParquetStatsContext : dwio::common::StatsContext {};
 } // namespace
@@ -1028,6 +1231,7 @@ class ParquetRowReader::Impl {
         columnReaderStats_,
         readerBase_->thriftFileMetaData(),
         options_.timestampPrecision(),
+        readerBase->fileDecryptor(),
         schemaHelper_,
         options_.isDictionaryFilterEnabled(),
         options_.getDecodeRepDefPageCount(),

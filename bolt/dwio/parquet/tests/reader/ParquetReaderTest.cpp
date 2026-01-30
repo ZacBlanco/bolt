@@ -36,6 +36,8 @@
 #include "bolt/vector/BaseVector.h"
 #include "bolt/vector/tests/utils/VectorMaker.h"
 
+#include "bolt/dwio/parquet/encryption/KmsClient.h"
+
 using namespace bytedance::bolt;
 using namespace bytedance::bolt::common;
 using namespace bytedance::bolt::dwio::common;
@@ -1147,6 +1149,90 @@ TEST_F(ParquetReaderTest, arrayWithEmptyEntry) {
   rowReader->next(7, result);
   assertEqualVectorPart(expected, result, 0);
 }
+
+TEST_F(ParquetReaderTest, readEncryptedParquet) {
+  auto rowType = ROW({"id", "name", "salary"}, {BIGINT(), VARCHAR(), BIGINT()});
+
+  bytedance::bolt::dwio::common::ReaderOptions readerOpts{leafPool_.get()};
+
+  std::string encryptionData = getExampleFilePath("encrypted_sample.parquet");
+
+  auto reader = createReader(encryptionData, readerOpts);
+  RowReaderOptions rowReaderOpts;
+  rowReaderOpts.setScanSpec(makeScanSpec(rowType));
+  auto rowReader = reader->createRowReader(rowReaderOpts);
+
+  auto numRows = reader->numberOfRows();
+  ASSERT_TRUE(numRows.has_value());
+  EXPECT_EQ(numRows.value(), 3);
+
+  auto type = reader->typeWithId();
+  EXPECT_EQ(type->size(), rowType->size());
+  EXPECT_EQ(type->type()->kind(), TypeKind::ROW);
+
+  auto result = BaseVector::create(rowType, 3, leafPool_.get());
+  auto rowsRead = rowReader->next(3, result);
+  EXPECT_EQ(rowsRead, 3);
+  EXPECT_EQ(result->size(), 3);
+
+  auto ids = result->as<RowVector>()->childAt(0)->asFlatVector<int64_t>();
+  EXPECT_EQ(ids->valueAt(0), 1);
+}
+
+TEST_F(ParquetReaderTest, readEncryptedParquetAllValues) {
+  auto rowType = ROW({"id", "name", "salary"}, {BIGINT(), VARCHAR(), BIGINT()});
+
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3}),
+      makeFlatVector<std::string>({"Alice", "Bob", "Charlie"}),
+      makeFlatVector<int64_t>({100000, 90000, 110000}),
+  });
+
+  assertReadWithExpected("encrypted_sample.parquet", rowType, expected);
+}
+
+TEST_F(ParquetReaderTest, readEncryptedParquetWithProjection) {
+  auto projectedType = ROW({"name", "salary"}, {VARCHAR(), BIGINT()});
+
+  const std::string sample(getExampleFilePath("encrypted_sample.parquet"));
+
+  bytedance::bolt::dwio::common::ReaderOptions readerOptions{leafPool_.get()};
+  readerOptions.setFileSchema(projectedType);
+  auto reader = createReader(sample, readerOptions);
+
+  auto rowReaderOpts = getReaderOpts(projectedType);
+  auto scanSpec = makeScanSpec(projectedType);
+  rowReaderOpts.setScanSpec(scanSpec);
+  auto rowReader = reader->createRowReader(rowReaderOpts);
+
+  auto expected = makeRowVector({
+      makeFlatVector<std::string>({"Alice", "Bob", "Charlie"}),
+      makeFlatVector<int64_t>({100000, 90000, 110000}),
+  });
+
+  auto result = BaseVector::create(projectedType, 3, leafPool_.get());
+  auto rowsRead = rowReader->next(3, result);
+  EXPECT_EQ(rowsRead, 3);
+  EXPECT_EQ(result->size(), 3);
+  assertEqualVectorPart(expected, result, 0);
+}
+
+TEST_F(ParquetReaderTest, readEncryptedParquetWithFilters) {
+  auto rowType = ROW({"id", "name", "salary"}, {BIGINT(), VARCHAR(), BIGINT()});
+
+  FilterMap filters;
+  filters.insert({"salary", exec::greaterThan(int64_t(100000))});
+
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>(1, [](auto row) { return 3; }),
+      makeFlatVector<std::string>({"Charlie"}),
+      makeFlatVector<int64_t>(1, [](auto row) { return 110000; }),
+  });
+
+  assertReadWithFilters(
+      "encrypted_sample.parquet", rowType, std::move(filters), expected);
+}
+
 TEST_F(ParquetReaderTest, readBinaryAsStringFromNation) {
   const std::string filename("nation.parquet");
   const std::string sample(getExampleFilePath(filename));
