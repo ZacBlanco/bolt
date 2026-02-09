@@ -308,7 +308,7 @@ def process_gha_output(stdout):
     in_gha = os.environ.get("GITHUB_ACTIONS") is not None
     if in_gha and stdout:
         clang_tidy_pattern = (
-            r"^(.*):(\d+):(\d+):\s+(error|warning):\s+(.*?)\s+\[([^\]]+)\]\s*$"
+            r"^(.*):(\d+):(\d+):\s+(error|warning):\s+(.*) $([a-z0-9,\-]+)$\s*$"
         )
         for stdout_line in stdout.split("\n"):
             m = re.match(clang_tidy_pattern, stdout_line)
