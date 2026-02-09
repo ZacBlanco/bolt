@@ -34,7 +34,7 @@ import sys
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, List, Dict
+from typing import Optional, List
 
 
 class Multimap(dict):
@@ -82,7 +82,9 @@ def _git_has_ref(ref: str) -> bool:
 
 def _git_upstream_ref() -> Optional[str]:
     # Example output: origin/main
-    return _git_stdout(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
+    return _git_stdout(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]
+    )
 
 
 def _git_merge_base(a: str, b: str) -> Optional[str]:
@@ -249,11 +251,7 @@ def get_base_ref_from_github_event() -> Optional[str]:
         return None
 
     if event_name in ("pull_request", "pull_request_target", "pull_request_review"):
-        return (
-            payload.get("pull_request", {})
-            .get("base", {})
-            .get("sha")
-        )
+        return payload.get("pull_request", {}).get("base", {}).get("sha")
 
     if event_name == "merge_group":
         return payload.get("merge_group", {}).get("base_sha")
@@ -332,7 +330,9 @@ def tidy(args):
 
     # Normalize candidate files (if provided) for later matching.
     git_root = get_git_root()
-    candidate_files = [to_repo_rel(normalize_path(f), git_root) for f in candidate_files]
+    candidate_files = [
+        to_repo_rel(normalize_path(f), git_root) for f in candidate_files
+    ]
 
     exclude_re = None
     if args.exclude:
@@ -383,7 +383,11 @@ def tidy(args):
 
     if diff_mode == "auto":
         if _truthy_env("GITHUB_ACTIONS") or _truthy_env("IN_CI"):
-            base_ref = base_ref or os.environ.get("CI_BASE_SHA") or get_base_ref_from_github_event()
+            base_ref = (
+                base_ref
+                or os.environ.get("CI_BASE_SHA")
+                or get_base_ref_from_github_event()
+            )
             diff_mode = "base" if base_ref else "staged"
         else:
             diff_mode = "local"
@@ -398,7 +402,10 @@ def tidy(args):
 
             if diff_mode == "base":
                 if not base_ref:
-                    print("Error: --diff=base requires --base-ref (or CI_BASE_SHA in CI).", file=sys.stderr)
+                    print(
+                        "Error: --diff=base requires --base-ref (or CI_BASE_SHA in CI).",
+                        file=sys.stderr,
+                    )
                     return None
                 base_map = git_changed_lines(base_ref=base_ref, staged=False)
                 staged_map = git_changed_lines(base_ref="HEAD", staged=True)
@@ -410,7 +417,9 @@ def tidy(args):
 
                 # If there is no meaningful base (e.g. directly on main with no commits ahead),
                 # fall back to only the last commit.
-                commits_ahead = _git_commits_ahead(base_sha, "HEAD") if base_sha else None
+                commits_ahead = (
+                    _git_commits_ahead(base_sha, "HEAD") if base_sha else None
+                )
                 if base_sha and commits_ahead == 0:
                     base_sha = None
 
@@ -418,7 +427,11 @@ def tidy(args):
                     if _git_has_ref("HEAD^"):
                         base_sha = "HEAD^"
 
-                base_map = git_changed_lines(base_ref=base_sha, staged=False) if base_sha else Multimap()
+                base_map = (
+                    git_changed_lines(base_ref=base_sha, staged=False)
+                    if base_sha
+                    else Multimap()
+                )
                 staged_map = git_changed_lines(base_ref="HEAD", staged=True)
                 return merge_changed_lines(base_map, staged_map)
 
