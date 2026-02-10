@@ -59,7 +59,6 @@ jobs:
       - name: Generate Compile Database
         run: |
           make compile_db_all
-          cmake --build --preset conan-release --target generate_parquet_thrift
       - name: Run pre-commit hooks
         run: |
           pre-commit run --all-files
