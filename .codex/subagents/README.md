@@ -4,7 +4,7 @@ This directory defines repo-local Codex subagent configurations for working on B
 
 The current set is workflow-oriented rather than directory-oriented.
 
-The Bolt build workflow now lives in the repo-local skill at [.codex/skills/build/SKILL.md](/Users/bytedance/projects/bolt-github/.codex/skills/build/SKILL.md).
+The Bolt build workflow now lives in the repo-local skill at [.codex/skills/bolt-build/SKILL.md](/Users/bytedance/projects/bolt-github/.codex/skills/bolt-build/SKILL.md).
 
 The remaining subagents are:
 
