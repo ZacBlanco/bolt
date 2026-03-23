@@ -1,0 +1,70 @@
+version: 1
+
+subagents:
+  - id: validate-debug
+    name: Validation and Debug Agent
+    agent_type: worker
+    model: gpt-5.4-mini
+    reasoning_effort: medium
+    prompt_file: .codex/subagents/validate-debug.md
+    use_when:
+      - "You need focused test coverage, a regression test, or a benchmark result."
+      - "You are debugging a crash, flaky test, wrong result, or hard-to-reproduce failure."
+      - "You need trace replay or a minimal reproducer."
+    avoid_when:
+      - "The primary task is build-system repair before tests can run at all."
+    outputs:
+      - "Reproduction steps and observed behavior."
+      - "Focused validation commands and results."
+      - "New or updated tests, benchmarks, or traces where appropriate."
+
+  - id: api-integration
+    name: API and Integration Agent
+    agent_type: worker
+    model: gpt-5.4
+    reasoning_effort: medium
+    prompt_file: .codex/subagents/api-integration.md
+    use_when:
+      - "The task affects external-facing APIs, connectors, storage adapters, or integration contracts."
+      - "The user needs guidance on how another system should call into or extend Bolt."
+      - "Compatibility and developer ergonomics matter more than raw engine internals."
+    avoid_when:
+      - "The task is purely an internal hot-path optimization with no API or contract impact."
+    outputs:
+      - "The API or integration contract being preserved or changed."
+      - "Backward-compatibility risks."
+      - "Code changes and usage or migration notes if needed."
+
+  - id: perf-vectorization
+    name: Performance and Vectorization Agent
+    agent_type: worker
+    model: gpt-5.4
+    reasoning_effort: high
+    prompt_file: .codex/subagents/perf-vectorization.md
+    use_when:
+      - "The task is about throughput, latency, allocation pressure, vectorized execution, or hot-path behavior."
+      - "A change needs benchmark-backed performance analysis."
+      - "The issue involves memory layout, CPU efficiency, or operator-level optimization."
+    avoid_when:
+      - "The immediate problem is a compile failure or a clearly external API design question."
+    outputs:
+      - "Performance hypothesis and evidence."
+      - "A minimally risky optimization or a clear reason not to change the code."
+      - "Benchmark commands and before/after results when available."
+
+  - id: semantics-correctness
+    name: Query Semantics and Correctness Agent
+    agent_type: worker
+    model: gpt-5.4
+    reasoning_effort: high
+    prompt_file: .codex/subagents/semantics-correctness.md
+    use_when:
+      - "The task involves wrong results, null semantics, coercions, expression behavior, or function parity."
+      - "The issue affects plan translation or logical correctness."
+      - "You need a careful semantic review before optimizing or refactoring."
+    avoid_when:
+      - "The task is mostly about infrastructure, build plumbing, or benchmark automation."
+    outputs:
+      - "The expected semantic behavior."
+      - "A failing case or proof of correctness."
+      - "Tests covering the corrected or preserved behavior."
