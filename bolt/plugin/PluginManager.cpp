@@ -10,6 +10,7 @@
 #include "bolt/connectors/Connector.h"
 #include "bolt/exec/Aggregate.h"
 #include "bolt/expression/VectorFunction.h"
+#include "bolt/plugin/OperatorRegistry.h"
 #include "bolt/plugin/api/PluginRegistrar.h"
 #include "bolt/type/Type.h"
 #include "bolt/vector/VectorStream.h"
@@ -46,10 +47,7 @@ class RegistryBackedRegistrar final : public PluginRegistrar {
   }
 
   void addOperator(OperatorSpec spec) override {
-    BOLT_NYI(
-        "Operator registration is declared in the plugin API but not wired to "
-        "execution registration yet. Operator: {}",
-        spec.name);
+    registerOperatorSpec(std::move(spec));
   }
 
   void addOptimizerPass(OptimizerPassSpec spec) override {

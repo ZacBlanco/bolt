@@ -43,7 +43,11 @@
 #include "bolt/exec/tests/utils/LocalExchangeSource.h"
 #include "bolt/exec/tests/utils/PlanBuilder.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
+#include "bolt/plugin/api/IPlugin.h"
+#include "bolt/plugin/api/PluginRegistrar.h"
 #include "folly/experimental/EventCount.h"
+#include <numeric>
+#include <utility>
 
 using namespace bytedance::bolt::exec::test;
 
@@ -1773,6 +1777,141 @@ class TestCustomExchangeTranslator : public exec::Operator::PlanNodeTranslator {
   }
 };
 
+class TestCustomExchangePluginTranslator final
+    : public ::bytedance::bolt::plugin::OperatorTranslator {
+ public:
+  std::unique_ptr<exec::Operator> toOperator(
+      exec::DriverCtx* ctx,
+      int32_t id,
+      const core::PlanNodePtr& node,
+      std::shared_ptr<ExchangeClient> exchangeClient) override {
+    if (auto customExchangeNode =
+            std::dynamic_pointer_cast<const TestCustomExchangeNode>(node)) {
+      return std::make_unique<TestCustomExchange>(
+          id, ctx, customExchangeNode, std::move(exchangeClient));
+    }
+    return nullptr;
+  }
+};
+
+class TestCustomExchangePlugin final : public ::bytedance::bolt::plugin::IPlugin {
+ public:
+  const std::string& name() const override {
+    static const std::string kName{"test_custom_exchange_plugin"};
+    return kName;
+  }
+
+  void registerInto(::bytedance::bolt::plugin::PluginRegistrar& registrar)
+      override {
+    registrar.setMetadata({name(), "0.1.0", "v1", "bolt-tests"});
+    registrar.addOperator(
+        {.name = "test_custom_exchange_operator",
+         .translator = std::make_shared<TestCustomExchangePluginTranslator>()});
+  }
+};
+
+class TestPluginPassthroughNode : public core::PlanNode {
+ public:
+  TestPluginPassthroughNode(const core::PlanNodeId& id, core::PlanNodePtr source)
+      : PlanNode(id), sources_{std::move(source)} {}
+
+  const RowTypePtr& outputType() const override {
+    return sources_[0]->outputType();
+  }
+
+  const std::vector<core::PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  std::string_view name() const override {
+    return "TestPluginPassthrough";
+  }
+
+ private:
+  void addDetails(std::stringstream& /* stream */) const override {}
+
+  std::vector<core::PlanNodePtr> sources_;
+};
+
+class TestPluginPassthroughOperator : public Operator {
+ public:
+  TestPluginPassthroughOperator(
+      int32_t operatorId,
+      DriverCtx* driverCtx,
+      std::shared_ptr<const TestPluginPassthroughNode> node)
+      : Operator(
+            driverCtx,
+            node->outputType(),
+            operatorId,
+            node->id(),
+            "TestPluginPassthroughOperator") {}
+
+  void addInput(RowVectorPtr input) override {
+    input_ = std::move(input);
+  }
+
+  bool needsInput() const override {
+    return !noMoreInput_ && input_ == nullptr;
+  }
+
+  RowVectorPtr getOutput() override {
+    if (input_ == nullptr) {
+      return nullptr;
+    }
+    stats_.wlock()->addRuntimeStat("pluginPassthroughStat", RuntimeCounter(1));
+    return std::exchange(input_, nullptr);
+  }
+
+  void noMoreInput() override {
+    Operator::noMoreInput();
+    noMoreInput_ = true;
+  }
+
+  BlockingReason isBlocked(ContinueFuture* future) override {
+    return BlockingReason::kNotBlocked;
+  }
+
+  bool isFinished() override {
+    return noMoreInput_ && input_ == nullptr;
+  }
+
+ private:
+  RowVectorPtr input_;
+  bool noMoreInput_{false};
+};
+
+class TestPluginPassthroughTranslator final
+    : public ::bytedance::bolt::plugin::OperatorTranslator {
+ public:
+  std::unique_ptr<exec::Operator> toOperator(
+      exec::DriverCtx* ctx,
+      int32_t id,
+      const core::PlanNodePtr& node) override {
+    if (auto passthroughNode =
+            std::dynamic_pointer_cast<const TestPluginPassthroughNode>(node)) {
+      return std::make_unique<TestPluginPassthroughOperator>(
+          id, ctx, std::move(passthroughNode));
+    }
+    return nullptr;
+  }
+};
+
+class TestPluginPassthroughPlugin final : public ::bytedance::bolt::plugin::IPlugin {
+ public:
+  const std::string& name() const override {
+    static const std::string kName{"test_plugin_passthrough_plugin"};
+    return kName;
+  }
+
+  void registerInto(::bytedance::bolt::plugin::PluginRegistrar& registrar)
+      override {
+    registrar.setMetadata({name(), "0.1.0", "v1", "bolt-tests"});
+    registrar.addOperator(
+        {.name = "test_plugin_passthrough_operator",
+         .translator = std::make_shared<TestPluginPassthroughTranslator>()});
+  }
+};
+
 TEST_F(MultiFragmentTest, customPlanNodeWithExchangeClient) {
   setupSources(5, 100);
   Operator::registerOperator(std::make_unique<TestCustomExchangeTranslator>());
@@ -1807,6 +1946,88 @@ TEST_F(MultiFragmentTest, customPlanNodeWithExchangeClient) {
       toPlanStats(task->taskStats())
           .at(testNodeId)
           .customStats.count("testCustomExchangeStat"),
+      0);
+}
+
+TEST_F(MultiFragmentTest, customPlanNodeWithExchangeClientViaPlugin) {
+  setupSources(5, 100);
+  auto leafTaskId = makeTaskId("leaf", 0);
+  auto leafPlan =
+      PlanBuilder().values(vectors_).partitionedOutput({}, 1).planNode();
+  auto leafTask = makeTask(leafTaskId, leafPlan, 0);
+  leafTask->start(1);
+
+  auto queryCtx = core::QueryCtx::create(executor_.get());
+  ASSERT_TRUE(
+      queryCtx->addPlugin(std::make_shared<TestCustomExchangePlugin>()));
+
+  CursorParameters params;
+  core::PlanNodeId testNodeId;
+  params.maxDrivers = 1;
+  params.queryCtx = queryCtx;
+  params.planNode =
+      PlanBuilder()
+          .addNode([&leafPlan](std::string id, core::PlanNodePtr /* input */) {
+            return std::make_shared<TestCustomExchangeNode>(
+                id, leafPlan->outputType());
+          })
+          .capturePlanNodeId(testNodeId)
+          .planNode();
+
+  auto cursor = TaskCursor::create(params);
+  auto task = cursor->task();
+  addRemoteSplits(task, {leafTaskId});
+  while (cursor->moveNext()) {
+  }
+  ASSERT_TRUE(waitForTaskCompletion(leafTask.get(), 3'000'000))
+      << leafTask->taskId();
+  ASSERT_TRUE(waitForTaskCompletion(task.get(), 3'000'000)) << task->taskId();
+
+  EXPECT_NE(
+      toPlanStats(task->taskStats())
+          .at(testNodeId)
+          .customStats.count("testCustomExchangeStat"),
+      0);
+}
+
+TEST_F(MultiFragmentTest, customPlanNodeWithoutExchangeViaPlugin) {
+  setupSources(5, 100);
+  auto queryCtx = core::QueryCtx::create(executor_.get());
+  ASSERT_TRUE(
+      queryCtx->addPlugin(std::make_shared<TestPluginPassthroughPlugin>()));
+
+  CursorParameters params;
+  core::PlanNodeId pluginNodeId;
+  params.maxDrivers = 1;
+  params.queryCtx = queryCtx;
+  params.planNode =
+      PlanBuilder()
+          .values(vectors_)
+          .addNode([](std::string id, core::PlanNodePtr input) {
+            return std::make_shared<TestPluginPassthroughNode>(
+                id, std::move(input));
+          })
+          .capturePlanNodeId(pluginNodeId)
+          .planNode();
+
+  auto cursor = TaskCursor::create(params);
+  uint64_t outputRows = 0;
+  while (cursor->moveNext()) {
+    outputRows += cursor->current()->size();
+  }
+
+  auto task = cursor->task();
+  ASSERT_TRUE(waitForTaskCompletion(task.get(), 3'000'000)) << task->taskId();
+  const uint64_t expectedRows = std::accumulate(
+      vectors_.begin(),
+      vectors_.end(),
+      uint64_t{0},
+      [](uint64_t sum, const RowVectorPtr& vector) { return sum + vector->size(); });
+  EXPECT_EQ(outputRows, expectedRows);
+  EXPECT_NE(
+      toPlanStats(task->taskStats())
+          .at(pluginNodeId)
+          .customStats.count("pluginPassthroughStat"),
       0);
 }
 

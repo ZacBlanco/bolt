@@ -42,6 +42,7 @@
 #include "bolt/common/testutil/TestValue.h"
 #include "bolt/core/QueryConfig.h"
 #include "bolt/exec/Driver.h"
+#include "bolt/exec/plugin/OperatorPluginAdapter.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/Task.h"
 #include "bolt/exec/TraceUtil.h"
@@ -49,6 +50,15 @@
 
 using bytedance::bolt::common::testutil::TestValue;
 namespace bytedance::bolt::exec {
+namespace {
+void ensureOperatorPluginBridgeInitialized() {
+  static const bool initialized = [] {
+    ::bytedance::bolt::exec::plugin::initializeOperatorPluginAdapter();
+    return true;
+  }();
+  (void)initialized;
+}
+} // namespace
 
 OperatorCtx::OperatorCtx(
     DriverCtx* driverCtx,
@@ -207,6 +217,7 @@ std::unique_ptr<Operator> Operator::fromPlanNode(
     int32_t id,
     const core::PlanNodePtr& planNode,
     std::shared_ptr<ExchangeClient> exchangeClient) {
+  ensureOperatorPluginBridgeInitialized();
   BOLT_CHECK_EQ(exchangeClient != nullptr, planNode->requiresExchangeClient());
   for (auto& translator : translators()) {
     std::unique_ptr<Operator> op;
@@ -226,6 +237,7 @@ std::unique_ptr<Operator> Operator::fromPlanNode(
 // static
 std::unique_ptr<JoinBridge> Operator::joinBridgeFromPlanNode(
     const core::PlanNodePtr& planNode) {
+  ensureOperatorPluginBridgeInitialized();
   for (auto& translator : translators()) {
     auto joinBridge = translator->toJoinBridge(planNode);
     if (joinBridge) {
@@ -251,6 +263,7 @@ void Operator::initialize() {
 // static
 OperatorSupplier Operator::operatorSupplierFromPlanNode(
     const core::PlanNodePtr& planNode) {
+  ensureOperatorPluginBridgeInitialized();
   for (auto& translator : translators()) {
     auto supplier = translator->toOperatorSupplier(planNode);
     if (supplier) {
@@ -273,6 +286,7 @@ void Operator::unregisterAllOperators() {
 
 std::optional<uint32_t> Operator::maxDrivers(
     const core::PlanNodePtr& planNode) {
+  ensureOperatorPluginBridgeInitialized();
   for (auto& translator : translators()) {
     auto current = translator->maxDrivers(planNode);
     if (current) {

@@ -12,6 +12,7 @@
 #include "bolt/connectors/Connector.h"
 #include "bolt/exec/Aggregate.h"
 #include "bolt/expression/VectorFunction.h"
+#include "bolt/plugin/api/OperatorExtension.h"
 #include "bolt/type/Type.h"
 #include "bolt/vector/VectorStream.h"
 
@@ -45,6 +46,7 @@ struct ConnectorFactorySpec {
 
 struct OperatorSpec {
   std::string name;
+  std::shared_ptr<OperatorTranslator> translator;
 };
 
 enum class OptimizerStage {

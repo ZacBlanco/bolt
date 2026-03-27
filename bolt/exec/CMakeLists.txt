@@ -77,6 +77,7 @@ bolt_add_library(
   OperatorTraceScan.cpp
   OperatorTraceWriter.cpp
   OperatorUtils.cpp
+  plugin/OperatorPluginAdapter.cpp
   OrderBy.cpp
   OutputBuffer.cpp
   OutputBufferManager.cpp
