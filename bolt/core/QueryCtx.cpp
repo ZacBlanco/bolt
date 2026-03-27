@@ -29,10 +29,44 @@
  */
 
 #include "bolt/core/QueryCtx.h"
+#include <algorithm>
+#include <cctype>
+#include <sstream>
+#include <vector>
 #include "bolt/common/base/SpillConfig.h"
 #include "bolt/common/config/Config.h"
 #include "bolt/exec/TraceConfig.h"
+#include "bolt/plugin/PluginManager.h"
 namespace bytedance::bolt::core {
+namespace {
+std::vector<std::string> parsePluginLoadPaths(const std::string& input) {
+  std::vector<std::string> paths;
+  if (input.empty()) {
+    return paths;
+  }
+  std::istringstream ss(input);
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    token.erase(
+        token.begin(),
+        std::find_if(
+            token.begin(),
+            token.end(),
+            [](unsigned char ch) { return !std::isspace(ch); }));
+    token.erase(
+        std::find_if(
+            token.rbegin(),
+            token.rend(),
+            [](unsigned char ch) { return !std::isspace(ch); })
+            .base(),
+        token.end());
+    if (!token.empty()) {
+      paths.push_back(std::move(token));
+    }
+  }
+  return paths;
+}
+} // namespace
 
 // static
 std::shared_ptr<QueryCtx> QueryCtx::create(
@@ -71,8 +105,30 @@ QueryCtx::QueryCtx(
       cache_(cache),
       connectorSessionProperties_(connectorSessionProperties),
       pool_(std::move(pool)),
-      queryConfig_{std::move(queryConfig)} {
+      queryConfig_{std::move(queryConfig)},
+      pluginManager_(std::make_shared<plugin::PluginManager>()) {
   initPool(queryId);
+  for (const auto& path : parsePluginLoadPaths(queryConfig_.pluginLoadPaths())) {
+    pluginManager_->loadPlugin(path);
+  }
+}
+
+const std::shared_ptr<plugin::PluginManager>& QueryCtx::pluginManager() const {
+  return pluginManager_;
+}
+
+void QueryCtx::setPluginManager(
+    std::shared_ptr<plugin::PluginManager> pluginManager) {
+  BOLT_USER_CHECK_NOT_NULL(pluginManager, "PluginManager cannot be null");
+  pluginManager_ = std::move(pluginManager);
+}
+
+bool QueryCtx::loadPlugin(const std::string& path) {
+  return pluginManager_->loadPlugin(path);
+}
+
+bool QueryCtx::addPlugin(const std::shared_ptr<plugin::IPlugin>& plugin) {
+  return pluginManager_->addPlugin(plugin);
 }
 
 /*static*/ std::string QueryCtx::generatePoolName(const std::string& queryId) {

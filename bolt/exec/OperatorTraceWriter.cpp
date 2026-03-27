@@ -39,6 +39,7 @@
 #include "bolt/exec/Operator.h"
 #include "bolt/exec/Trace.h"
 #include "bolt/exec/TraceUtil.h"
+#include "bolt/plugin/builtin/StandardVectorFormatsPlugin.h"
 namespace bytedance::bolt::exec::trace {
 namespace {
 void recordOperatorSummary(Operator* op, folly::dynamic& obj) {
@@ -66,9 +67,9 @@ OperatorTraceInputWriter::OperatorTraceInputWriter(
       fs_(filesystems::getFileSystem(traceDir_, nullptr)),
       pool_(pool),
       updateAndCheckTraceLimitCB_(std::move(updateAndCheckTraceLimitCB)) {
-  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kPresto)) {
-    serializer::presto::PrestoVectorSerde::registerNamedVectorSerde();
-  }
+  auto queryCtx = traceOp_->operatorCtx()->task()->queryCtx();
+  BOLT_CHECK_NOT_NULL(queryCtx);
+  queryCtx->addPlugin(plugin::builtin::createStandardVectorFormatsPlugin());
   serde_ = getNamedVectorSerde(VectorSerde::Kind::kPresto);
   traceFile_ = fs_->openFileForWrite(getOpTraceInputFilePath(traceDir_));
   BOLT_CHECK_NOT_NULL(traceFile_);

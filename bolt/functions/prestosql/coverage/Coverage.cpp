@@ -30,10 +30,10 @@
 
 #include <gflags/gflags.h>
 
+#include "bolt/core/QueryCtx.h"
 #include "bolt/functions/CoverageUtil.h"
-#include "bolt/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
-#include "bolt/functions/prestosql/registration/RegistrationFunctions.h"
 #include "bolt/functions/prestosql/window/WindowFunctionsRegistration.h"
+#include "bolt/plugin/builtin/PrestoFunctionsPlugin.h"
 
 DEFINE_bool(all, false, "Generate coverage map for all Presto functions");
 DEFINE_bool(
@@ -45,11 +45,9 @@ using namespace bytedance::bolt;
 int main(int argc, char** argv) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  // Register all simple and vector scalar functions.
-  functions::prestosql::registerAllScalarFunctions();
-
-  // Register Presto aggregate functions.
-  aggregate::prestosql::registerAllAggregateFunctions();
+  // Proof-of-integration startup path via query-scoped PluginManager.
+  auto queryCtx = core::QueryCtx::create();
+  queryCtx->addPlugin(plugin::builtin::createPrestoFunctionsPlugin());
 
   // Register Presto window functions.
   window::prestosql::registerAllWindowFunctions();

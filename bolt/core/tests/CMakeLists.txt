@@ -25,6 +25,17 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
+add_library(
+  bolt_test_runtime_plugin
+  MODULE
+  TestRuntimePlugin.cpp
+)
+
+target_link_libraries(
+  bolt_test_runtime_plugin
+  PRIVATE fmt::fmt
+)
+
 add_executable(
   bolt_core_test
   ConstantTypedExprTest.cpp
@@ -35,6 +46,28 @@ add_executable(
   TypeAnalysisTest.cpp
   TypedExprSerdeTest.cpp
 )
+
+target_compile_definitions(
+  bolt_core_test
+  PRIVATE BOLT_TEST_RUNTIME_PLUGIN_PATH="$<TARGET_FILE:bolt_test_runtime_plugin>"
+)
+
+target_link_options(
+  bolt_core_test
+  PRIVATE -Wl,--export-dynamic
+)
+
+target_include_directories(
+  bolt_test_runtime_plugin
+  PRIVATE $<TARGET_PROPERTY:bolt_core_test,INCLUDE_DIRECTORIES>
+)
+
+target_compile_definitions(
+  bolt_test_runtime_plugin
+  PRIVATE $<TARGET_PROPERTY:bolt_core_test,COMPILE_DEFINITIONS>
+)
+
+add_dependencies(bolt_core_test bolt_test_runtime_plugin)
 
 add_test(bolt_core_test bolt_core_test)
 

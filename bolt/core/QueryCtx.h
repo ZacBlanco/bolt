@@ -41,6 +41,10 @@
 namespace bytedance::bolt {
 class Config;
 }
+namespace bytedance::bolt::plugin {
+class PluginManager;
+class IPlugin;
+} // namespace bytedance::bolt::plugin
 namespace bytedance::bolt::core {
 
 class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
@@ -95,6 +99,16 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
   std::any& customContext() {
     return customContext_;
   }
+
+  /// Query-scoped plugin manager.
+  const std::shared_ptr<plugin::PluginManager>& pluginManager() const;
+
+  void setPluginManager(std::shared_ptr<plugin::PluginManager> pluginManager);
+
+  /// Convenience API for loading plugin into this query context.
+  bool loadPlugin(const std::string& path);
+
+  bool addPlugin(const std::shared_ptr<plugin::IPlugin>& plugin);
 
   config::ConfigBase* connectorSessionProperties(
       const std::string& connectorId) const {
@@ -244,6 +258,7 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
   /// Holds any value for Tasks invoked by downstream libs for injecting
   /// custom values. This value shall not be used by bolt.
   std::any customContext_;
+  std::shared_ptr<plugin::PluginManager> pluginManager_;
   std::atomic<uint64_t> numSpilledBytes_{0};
   std::atomic<uint64_t> numTracedBytes_{0};
 

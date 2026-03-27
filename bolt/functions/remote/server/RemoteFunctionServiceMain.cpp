@@ -32,7 +32,8 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
-#include "bolt/functions/prestosql/registration/RegistrationFunctions.h"
+#include "bolt/core/QueryCtx.h"
+#include "bolt/plugin/builtin/PrestoFunctionsPlugin.h"
 #include "bolt/functions/remote/server/RemoteFunctionService.h"
 
 /// This file generates a binary only meant for testing. It instantiates a
@@ -65,7 +66,9 @@ int main(int argc, char* argv[]) {
   // Always registers all Presto functions and make them available under a
   // certain prefix/namespace.
   LOG(INFO) << "Registering Presto functions";
-  functions::prestosql::registerAllScalarFunctions(FLAGS_function_prefix);
+  auto queryCtx = core::QueryCtx::create();
+  queryCtx->addPlugin(
+      plugin::builtin::createPrestoFunctionsPlugin(FLAGS_function_prefix));
 
   folly::SocketAddress location{
       folly::SocketAddress::makeFromPath(FLAGS_uds_path)};

@@ -29,11 +29,9 @@
  */
 
 #include <gflags/gflags.h>
-#include "bolt/exec/Aggregate.h"
+#include "bolt/core/QueryCtx.h"
 #include "bolt/functions/CoverageUtil.h"
-#include "bolt/functions/sparksql/aggregates/Register.h"
-#include "bolt/functions/sparksql/registration/Register.h"
-#include "bolt/functions/sparksql/window/WindowFunctionsRegistration.h"
+#include "bolt/plugin/builtin/SparkFunctionsPlugin.h"
 
 DEFINE_bool(all, false, "Generate coverage map for all Spark functions");
 using namespace bytedance::bolt;
@@ -41,14 +39,8 @@ using namespace bytedance::bolt;
 int main(int argc, char** argv) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  // Register all simple and vector scalar functions.
-  functions::sparksql::registerFunctions("");
-
-  // Register Spark aggregate functions.
-  functions::aggregate::sparksql::registerAggregateFunctions("");
-
-  // Register Spark window functions.
-  functions::window::sparksql::registerWindowFunctions("");
+  auto queryCtx = core::QueryCtx::create();
+  queryCtx->addPlugin(plugin::builtin::createSparkFunctionsPlugin());
 
   if (FLAGS_all) {
     functions::printCoverageMapForAll(":spark");

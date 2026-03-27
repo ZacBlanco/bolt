@@ -19,6 +19,7 @@
 
 #include "bolt/common/file/FileSystems.h"
 #include "bolt/connectors/tpch/TpchConnector.h"
+#include "bolt/core/QueryCtx.h"
 #include "bolt/dwio/orc/reader/RegisterOrcReader.h"
 #include "bolt/dwio/orc/writer/RegisterOrcWriter.h"
 #include "bolt/exec/tests/utils/AssertQueryBuilder.h"
@@ -26,9 +27,8 @@
 #include "bolt/exec/tests/utils/PlanBuilder.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
 #include "bolt/exec/tests/utils/TpchQueryBuilder.h"
-#include "bolt/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
-#include "bolt/functions/prestosql/registration/RegistrationFunctions.h"
-#include "bolt/functions/sparksql/Register.h"
+#include "bolt/plugin/builtin/PrestoFunctionsPlugin.h"
+#include "bolt/plugin/builtin/SparkFunctionsPlugin.h"
 #include "bolt/parse/TypeResolver.h"
 
 using namespace bytedance::bolt;
@@ -46,10 +46,10 @@ class OrcTpchTest : public testing::Test {
     tpchBuilder_ =
         std::make_shared<TpchQueryBuilder>(dwio::common::FileFormat::ORC);
 
-    functions::prestosql::registerAllScalarFunctions();
-    aggregate::prestosql::registerAllAggregateFunctions();
+    auto queryCtx = core::QueryCtx::create();
+    queryCtx->addPlugin(plugin::builtin::createPrestoFunctionsPlugin());
 #ifdef SPARK_COMPATIBLE
-    functions::sparksql::registerFunctions("");
+    queryCtx->addPlugin(plugin::builtin::createSparkFunctionsPlugin());
 #endif
 
     parse::registerTypeResolver();

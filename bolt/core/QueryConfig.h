@@ -643,6 +643,8 @@ class QueryConfig {
       "limit.offset.dictionary.encoding";
 
   static constexpr const char* kSessionOwner = "session_owner";
+  // Comma-separated plugin shared library paths to load into QueryCtx.
+  static constexpr const char* kPluginLoadPaths = "plugin.load_paths";
 
   static constexpr const char* kSumAggOverflowCheck =
       "sumAgg_overflow_check.enabled";
@@ -1468,6 +1470,10 @@ class QueryConfig {
 
   std::string sessionOwner() const {
     return get<std::string>(kSessionOwner, "");
+  }
+
+  std::string pluginLoadPaths() const {
+    return get<std::string>(kPluginLoadPaths, "");
   }
 
   bool sumAggOverflowCheck() const {

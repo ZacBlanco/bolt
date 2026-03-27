@@ -35,5 +35,8 @@ target_link_libraries(
 add_executable(bolt_functions_remote_server_main RemoteFunctionServiceMain.cpp)
 
 target_link_libraries(
-  bolt_functions_remote_server_main bolt_functions_remote_server bolt_functions_prestosql
+  bolt_functions_remote_server_main
+  bolt_core
+  bolt_functions_remote_server
+  bolt_functions_prestosql
 )

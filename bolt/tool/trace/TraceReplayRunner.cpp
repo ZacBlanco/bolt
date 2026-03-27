@@ -43,18 +43,17 @@
 #include "bolt/connectors/hive/storage_adapters/hdfs/RegisterHdfsFileSystem.h"
 #include "bolt/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h"
 #include "bolt/core/PlanNode.h"
+#include "bolt/core/QueryCtx.h"
 #include "bolt/dwio/dwrf/RegisterDwrfReader.h"
 #include "bolt/dwio/dwrf/RegisterDwrfWriter.h"
 #include "bolt/exec/OperatorTraceReader.h"
 #include "bolt/exec/PartitionFunction.h"
 #include "bolt/exec/TaskTraceReader.h"
 #include "bolt/exec/TraceUtil.h"
-#include "bolt/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
-#include "bolt/functions/prestosql/registration/RegistrationFunctions.h"
+#include "bolt/plugin/builtin/HiveConnectorPlugin.h"
+#include "bolt/plugin/builtin/PrestoFunctionsPlugin.h"
+#include "bolt/plugin/builtin/StandardVectorFormatsPlugin.h"
 #include "bolt/parse/TypeResolver.h"
-#include "bolt/serializers/ArrowSerializer.h"
-#include "bolt/serializers/CompactRowSerializer.h"
-#include "bolt/serializers/UnsafeRowSerializer.h"
 #include "bolt/tool/trace/AggregationReplayer.h"
 #include "bolt/tool/trace/FilterProjectReplayer.h"
 #include "bolt/tool/trace/HashJoinReplayer.h"
@@ -296,18 +295,6 @@ void TraceReplayRunner::init() {
   if (!isRegisteredVectorSerde()) {
     serializer::presto::PrestoVectorSerde::registerVectorSerde();
   }
-  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kPresto)) {
-    serializer::presto::PrestoVectorSerde::registerNamedVectorSerde();
-  }
-  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kCompactRow)) {
-    serializer::CompactRowVectorSerde::registerNamedVectorSerde();
-  }
-  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kUnsafeRow)) {
-    serializer::spark::UnsafeRowVectorSerde::registerNamedVectorSerde();
-  }
-  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kArrow)) {
-    serializer::arrowserde::ArrowVectorSerde::registerNamedVectorSerde();
-  }
   connector::hive::HiveTableHandle::registerSerDe();
   connector::hive::LocationHandle::registerSerDe();
   connector::hive::HiveColumnHandle::registerSerDe();
@@ -316,14 +303,12 @@ void TraceReplayRunner::init() {
   connector::hive::registerHivePartitionFunctionSerDe();
   connector::hive::HiveBucketProperty::registerSerDe();
 
-  functions::prestosql::registerAllScalarFunctions(FLAGS_function_prefix);
-  aggregate::prestosql::registerAllAggregateFunctions(FLAGS_function_prefix);
+  auto queryCtx = core::QueryCtx::create();
+  queryCtx->addPlugin(plugin::builtin::createStandardVectorFormatsPlugin());
+  queryCtx->addPlugin(plugin::builtin::createHiveConnectorPlugin());
+  queryCtx->addPlugin(
+      plugin::builtin::createPrestoFunctionsPlugin(FLAGS_function_prefix));
   parse::registerTypeResolver();
-
-  if (!bytedance::bolt::connector::hasConnectorFactory("hive")) {
-    connector::registerConnectorFactory(
-        std::make_shared<connector::hive::HiveConnectorFactory>());
-  }
 
   fs_ = filesystems::getFileSystem(FLAGS_root_dir, nullptr);
   const auto taskTraceDir = exec::trace::getTaskTraceDirectory(

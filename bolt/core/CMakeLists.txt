@@ -34,7 +34,7 @@ target_link_libraries(bolt_config bolt_exception Folly::folly)
 
 bolt_add_library(
   bolt_core Expressions.cpp PlanFragment.cpp PlanNode.cpp QueryConfig.cpp QueryCtx.cpp
-            SimpleFunctionMetadata.cpp
+            SimpleFunctionMetadata.cpp ../plugin/PluginManager.cpp
 )
 
 target_link_libraries(
@@ -53,6 +53,7 @@ target_link_libraries(
          Folly::folly
          fmt::fmt
   PRIVATE bolt_encode
+          ${CMAKE_DL_LIBS}
 )
 
 if(${BOLT_ENABLE_TORCH})
