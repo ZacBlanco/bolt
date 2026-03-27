@@ -1,0 +1,20 @@
+version: 1
+
+subagents:
+  - id: connector-implementation
+    name: Connector Implementation Agent
+    agent_type: worker
+    model: gpt-5.4
+    reasoning_effort: high
+    prompt_file: .codex/subagents/connector-implementation.md
+    use_when:
+      - "The task is to design, implement, or explain a Bolt connector."
+      - "A contributor needs repo-specific guidance on table handles, splits, data sources, connector factories, or connector tests."
+      - "The task needs a new connector integrated end to end with build wiring and validation."
+    avoid_when:
+      - "The task is only about hot-path optimization, semantics debugging, or a non-connector external API."
+    outputs:
+      - "A connector design grounded in Bolt's connector API."
+      - "Code changes, build wiring, and test coverage for the connector."
+      - "Build and test commands plus any assumptions or limitations."
+

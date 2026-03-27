@@ -30,6 +30,7 @@ bolt_add_library(bolt_connector Connector.cpp)
 target_link_libraries(bolt_connector bolt_common_config bolt_vector)
 
 add_subdirectory(fuzzer)
+add_subdirectory(procfs)
 
 if(${BOLT_ENABLE_HIVE_CONNECTOR})
   add_subdirectory(hive)

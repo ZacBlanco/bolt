@@ -36,6 +36,7 @@ constexpr const char* kArrowMemoryConnectorName = "arrow-memory";
 constexpr const char* kFuzzerConnectorName = "fuzzer";
 constexpr const char* kHiveConnectorName = "hive";
 constexpr const char* kHiveHadoop2ConnectorName = "hive-hadoop2";
+constexpr const char* kProcFsConnectorName = "procfs";
 constexpr const char* kTosConnectorName = "tos";
 constexpr const char* kTpchConnectorName = "tpch";
 
