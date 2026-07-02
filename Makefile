@@ -205,7 +205,7 @@ conan_build: conan_install
 	BOLT_BUILD_BENCHMARKS=${BOLT_BUILD_BENCHMARKS} \
 	BOLT_BUILD_TESTING_WITH_COVERAGE=${BOLT_BUILD_TESTING_WITH_COVERAGE} \
 	conan build ../.. --name=bolt --version=${BUILD_VERSION} --user=${BUILD_USER} --channel=${BUILD_CHANNEL} \
-	   -s llvm-core/*:build_type=Release \
+	   -s llvm-core/*:build_type=Release -nr \
 	   -s "&:build_type=${BUILD_TYPE}" \
 	   -s build_type=$${DEPENDENCY_BUILD_TYPE:-${BUILD_TYPE}} \
 	   --build=missing $${ALL_CONAN_OPTIONS} ${CONAN_CONFIG} && \
@@ -268,7 +268,7 @@ RelWithDebInfo:
 	$(MAKE) conan_build BUILD_TYPE=RelWithDebInfo
 
 release_with_test:
-	$(MAKE) conan_build BUILD_TYPE=Release CONAN_CONFIG=" -c bolt/*:tools.build:skip_test=False" CONAN_OPTIONS="-o bolt/*:spark_compatible=False -o bolt/*:enable_testutil=True"
+	$(MAKE) conan_build BUILD_TYPE=Release BOLT_BUILD_BENCHMARKS="ON" CONAN_CONFIG="  -c bolt/*:tools.build:skip_test=False" CONAN_OPTIONS="-o bolt/*:spark_compatible=False -o bolt/*:enable_testutil=True"
 
 release_with_debug_info_with_test:
 	$(MAKE) conan_build BUILD_TYPE=RelWithDebInfo CONAN_CONFIG=" -c bolt/*:tools.build:skip_test=False" CONAN_OPTIONS="-o bolt/*:spark_compatible=False -o bolt/*:enable_testutil=True"

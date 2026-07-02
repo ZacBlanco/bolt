@@ -31,7 +31,9 @@
 #include "bolt/exec/SpillFile.h"
 #include <lz4.h>
 #include <zstd.h>
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <vector>
 #include "bolt/common/base/RuntimeMetrics.h"
 #include "bolt/common/file/FileSystems.h"
@@ -157,6 +159,7 @@ void SpillWriteFile::finish() {
   if (spillUringEnabled_)
     writeBuffers_->clear(file_);
   size_ = file_->size();
+  BOLT_CHECK_EQ(size_, logicalSize_);
   file_->close();
   file_ = nullptr;
 }
@@ -169,7 +172,12 @@ uint64_t SpillWriteFile::size() const {
 }
 
 uint64_t SpillWriteFile::write(std::unique_ptr<folly::IOBuf> iobuf) {
-  auto writtenBytes = iobuf->computeChainDataLength();
+  return writeBlock(std::move(iobuf)).bytes;
+}
+
+SpillWriteFile::WriteBlockResult SpillWriteFile::writeBlock(
+    std::unique_ptr<folly::IOBuf> iobuf) {
+  WriteBlockResult result{logicalSize_, iobuf->computeChainDataLength()};
   if (spillUringEnabled_ && file_->uringEnabled()) {
     while (iobuf) {
       auto current = std::move(iobuf);
@@ -181,11 +189,17 @@ uint64_t SpillWriteFile::write(std::unique_ptr<folly::IOBuf> iobuf) {
   } else {
     file_->append(std::move(iobuf));
   }
-  return writtenBytes;
+  logicalSize_ += result.bytes;
+  return result;
 }
 
 uint64_t SpillWriteFile::write(std::string_view buf) {
-  auto writtenBytes = buf.size();
+  return writeBlock(buf).bytes;
+}
+
+SpillWriteFile::WriteBlockResult SpillWriteFile::writeBlock(
+    std::string_view buf) {
+  WriteBlockResult result{logicalSize_, buf.size()};
   if (spillUringEnabled_ && file_->uringEnabled()) {
     auto ioBuf = folly::IOBuf::copyBuffer(buf);
     auto taskId = taskId_++;
@@ -194,7 +208,8 @@ uint64_t SpillWriteFile::write(std::string_view buf) {
   } else {
     file_->append(buf);
   }
-  return writtenBytes;
+  logicalSize_ += result.bytes;
+  return result;
 }
 
 SpillWriter::SpillWriter(
@@ -220,7 +235,8 @@ SpillWriter::SpillWriter(
       stats_(stats),
       maxBatchRows_(maxBatchRows),
       rowInfo_(rowInfo),
-      spillSerdeKind_(ioConfig.spillSerdeKind) {
+      spillSerdeKind_(ioConfig.spillSerdeKind),
+      indexedSpillEnabled_(ioConfig.indexedSpillEnabled) {
   if (ioConfig.spillSerdeKind) {
     serde_ = getNamedVectorSerde(*ioConfig.spillSerdeKind);
   }
@@ -253,10 +269,13 @@ void SpillWriter::closeFile() {
       .size = currentFile_->size(),
       .rowCount = rowsInCurrentFile_,
       .sortingKeys = sortingKeys_,
+      .blocks = std::move(currentFileBlocks_),
       .compressionKind = compressionKind_,
       .serdeKind = spillSerdeKind_,
       .rowInfo = rowInfo_});
+  currentFileBlocks_.clear();
   rowsInCurrentFile_ = 0;
+  indexedRowsInCurrentFile_ = 0;
   currentFile_.reset();
 }
 
@@ -264,7 +283,24 @@ size_t SpillWriter::numFinishedFiles() const {
   return finishedFiles_.size();
 }
 
-uint64_t SpillWriter::flush() {
+void SpillWriter::recordBlock(
+    const SpillWriteFile::WriteBlockResult& block,
+    uint64_t rowCount) {
+  if (!indexedSpillEnabled_) {
+    return;
+  }
+  if (block.bytes == 0 && rowCount == 0) {
+    return;
+  }
+  currentFileBlocks_.push_back(SpillBlockInfo{
+      .offset = block.offset,
+      .size = block.bytes,
+      .rowOffset = indexedRowsInCurrentFile_,
+      .rowCount = rowCount});
+  indexedRowsInCurrentFile_ += rowCount;
+}
+
+uint64_t SpillWriter::flush(uint64_t blockRows) {
   if (batch_ == nullptr) {
     return 0;
   }
@@ -284,10 +320,13 @@ uint64_t SpillWriter::flush() {
   uint64_t writeTimeUs{0};
   uint64_t writtenBytes{0};
   auto iobuf = out.getIOBuf();
+  SpillWriteFile::WriteBlockResult block;
   {
     MicrosecondTimer timer(&writeTimeUs);
-    writtenBytes = file->write(std::move(iobuf));
+    block = file->writeBlock(std::move(iobuf));
+    writtenBytes = block.bytes;
   }
+  recordBlock(block, blockRows);
   updateWriteStats(writtenBytes, flushTimeUs, writeTimeUs);
   updateAndCheckSpillLimitCb_(writtenBytes);
   return writtenBytes;
@@ -332,7 +371,8 @@ uint64_t SpillWriter::write(
       !(maxBatchRows_ > 0 && unflushedRows_ >= maxBatchRows_)) {
     return 0;
   }
-  return flush();
+  const auto blockRows = unflushedRows_;
+  return flush(blockRows);
 }
 
 template <typename T>
@@ -374,7 +414,7 @@ uint64_t SpillWriter::writeAndFlush(
   }
   rowsInCurrentFile_ += rows->size();
   updateAppendStats(rows->size(), timeUs);
-  return flush();
+  return flush(rows->size());
 }
 
 uint64_t SpillWriter::write(
@@ -391,6 +431,7 @@ uint64_t SpillWriter::write(
   uint32_t* headerPtr = nullptr;
   uint64_t totalSize = 0;
   uint64_t timeUs{0}, compressWriteTimsUs{0};
+  vector_size_t needWriteRowCount = 0;
 
   // header store two uint32_t to save data size and compressed data size
   constexpr size_t headerSize = sizeof(uint32_t) * 2;
@@ -414,6 +455,7 @@ uint64_t SpillWriter::write(
     const char* writeBuffer = nullptr;
     size_t writeBufferSize = 0;
     uint64_t writtenBytes{0}, writeTimeUs{0}, compressTimeUs{0};
+    SpillWriteFile::WriteBlockResult block;
     if (info.enableCompression) {
       size_t needSize = headerSize +
           ((compressionKind_ == common::CompressionKind::CompressionKind_ZSTD)
@@ -456,9 +498,10 @@ uint64_t SpillWriter::write(
 
     {
       MicrosecondTimer timer(&writeTimeUs);
-      writtenBytes =
-          file->write(std::string_view(writeBuffer, writeBufferSize));
+      block = file->writeBlock(std::string_view(writeBuffer, writeBufferSize));
+      writtenBytes = block.bytes;
     }
+    recordBlock(block, needWriteRowCount);
     // keep writeBufferLimit to kBufferSize to avoid OOM in sort merge
     writeBufferLimit = std::min<size_t>(kBufferSize, buffer->capacity());
     // there is no flush here, so add compress time as flush time
@@ -470,7 +513,6 @@ uint64_t SpillWriter::write(
   {
     MicrosecondTimer timer(&timeUs);
     vector_size_t rowIndex = 0;
-    vector_size_t needWriteRowCount = 0;
     while (rowIndex < rows.size()) {
       char* row = rows[rowIndex];
       int32_t rowSize = 0;
@@ -549,7 +591,7 @@ void SpillWriter::updateSpilledFileStats(uint64_t fileSize) {
 
 void SpillWriter::finishFile() {
   checkNotFinished();
-  flush();
+  flush(unflushedRows_);
   closeFile();
   BOLT_CHECK_NULL(currentFile_);
 }
@@ -645,6 +687,124 @@ bool SpillReadFile::nextBatch(RowVectorPtr& rowVector) {
 
 void SpillReadFile::reuse() {
   input_->reuse();
+}
+
+std::unique_ptr<IndexedSpillReadFile> IndexedSpillReadFile::create(
+    const SpillFileInfo& fileInfo,
+    memory::MemoryPool* pool,
+    size_t maxCachedBlocks) {
+  return std::unique_ptr<IndexedSpillReadFile>(
+      new IndexedSpillReadFile(fileInfo, pool, maxCachedBlocks));
+}
+
+IndexedSpillReadFile::IndexedSpillReadFile(
+    const SpillFileInfo& fileInfo,
+    memory::MemoryPool* pool,
+    size_t maxCachedBlocks)
+    : fileInfo_(fileInfo),
+      pool_(pool),
+      maxCachedBlocks_(std::max<size_t>(1, maxCachedBlocks)),
+      readOptions_{kDefaultUseLosslessTimestamp, fileInfo.compressionKind},
+      serde_(
+          fileInfo.serdeKind.has_value()
+              ? getNamedVectorSerde(*fileInfo.serdeKind)
+              : nullptr) {
+  BOLT_CHECK_NOT_NULL(pool_);
+  BOLT_CHECK(
+      fileInfo_.rowCount == 0 || !fileInfo_.blocks.empty(),
+      "Indexed spill file requires block metadata");
+
+  uint64_t blockRows = 0;
+  uint64_t previousEnd = 0;
+  for (const auto& block : fileInfo_.blocks) {
+    BOLT_CHECK_EQ(block.rowOffset, blockRows);
+    BOLT_CHECK_LE(block.offset + block.size, fileInfo_.size);
+    BOLT_CHECK_GE(block.offset, previousEnd);
+    blockRows += block.rowCount;
+    previousEnd = block.offset + block.size;
+  }
+  BOLT_CHECK_EQ(
+      blockRows,
+      fileInfo_.rowCount,
+      "Indexed spill block row counts must sum to file row count");
+
+  auto fs = filesystems::getFileSystem(fileInfo_.path, nullptr);
+  file_ = fs->openFileForRead(fileInfo_.path);
+}
+
+IndexedSpillReadFile::RowReference IndexedSpillReadFile::rowAt(
+    uint64_t ordinal) {
+  const auto blockIndex = blockIndexForRow(ordinal);
+  auto batch = readBlock(blockIndex);
+  const auto& block = fileInfo_.blocks[blockIndex];
+  const auto rowIndex = ordinal - block.rowOffset;
+  BOLT_CHECK_LT(rowIndex, batch->size());
+  return RowReference{std::move(batch), static_cast<vector_size_t>(rowIndex)};
+}
+
+size_t IndexedSpillReadFile::blockIndexForRow(uint64_t ordinal) const {
+  BOLT_CHECK_LT(ordinal, fileInfo_.rowCount);
+  auto it = std::upper_bound(
+      fileInfo_.blocks.begin(),
+      fileInfo_.blocks.end(),
+      ordinal,
+      [](uint64_t row, const SpillBlockInfo& block) {
+        return row < block.rowOffset;
+      });
+  BOLT_CHECK(it != fileInfo_.blocks.begin());
+  --it;
+  BOLT_CHECK(
+      it != fileInfo_.blocks.end(),
+      "No indexed spill block found for row ordinal {}",
+      ordinal);
+  BOLT_CHECK_GE(ordinal, it->rowOffset);
+  return it - fileInfo_.blocks.begin();
+}
+
+void IndexedSpillReadFile::clearCache() {
+  blockCache_.clear();
+  blockCacheOrder_.clear();
+}
+
+RowVectorPtr IndexedSpillReadFile::readBlock(size_t blockIndex) {
+  auto cached = blockCache_.find(blockIndex);
+  if (cached != blockCache_.end()) {
+    return cached->second;
+  }
+
+  BOLT_CHECK_LT(blockIndex, fileInfo_.blocks.size());
+  const auto& block = fileInfo_.blocks[blockIndex];
+  BOLT_CHECK_LE(block.size, std::numeric_limits<int32_t>::max());
+  auto buffer = AlignedBuffer::allocate<char>(block.size, pool_);
+  {
+    MicrosecondTimer timer(&spillReadIOTimeUs_);
+    file_->pread(block.offset, block.size, buffer->asMutable<char>());
+  }
+
+  std::vector<ByteRange> ranges;
+  ranges.push_back(ByteRange{
+      .buffer = reinterpret_cast<uint8_t*>(buffer->asMutable<char>()),
+      .size = static_cast<int32_t>(block.size),
+      .position = 0});
+  ByteInputStream input(std::move(ranges));
+  RowVectorPtr rowVector;
+  if (serde_ != nullptr) {
+    serde_->deserialize(
+        &input, pool_, fileInfo_.type, &rowVector, &readOptions_);
+  } else {
+    VectorStreamGroup::read(
+        &input, pool_, fileInfo_.type, &rowVector, &readOptions_);
+  }
+  BOLT_CHECK_NOT_NULL(rowVector);
+  BOLT_CHECK_EQ(rowVector->size(), block.rowCount);
+
+  blockCacheOrder_.push_back(blockIndex);
+  blockCache_.emplace(blockIndex, rowVector);
+  while (blockCache_.size() > maxCachedBlocks_) {
+    blockCache_.erase(blockCacheOrder_.front());
+    blockCacheOrder_.pop_front();
+  }
+  return rowVector;
 }
 
 uint32_t RowBasedSpillReadFile::nextBatch(std::vector<char*>& rows) {

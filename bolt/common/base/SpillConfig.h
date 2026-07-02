@@ -151,6 +151,7 @@ struct SpillConfig : public bytedance::bolt::ISerializable {
     common::CompressionKind compressionKind;
     std::string fileCreateConfig;
     std::optional<VectorSerde::Kind> spillSerdeKind;
+    bool indexedSpillEnabled{false};
   };
 
   SpillIOConfig spillIOConfig(int32_t maxPartitions) const {
@@ -167,7 +168,8 @@ struct SpillConfig : public bytedance::bolt::ISerializable {
         writeBufferSize,
         compressionKind,
         fileCreateConfig,
-        kind};
+        kind,
+        indexedSpillEnabled};
   }
 
   /// The max spill file size. If it is zero, there is no limit on the spill
@@ -227,6 +229,10 @@ struct SpillConfig : public bytedance::bolt::ISerializable {
 
   /// Custom options passed to bolt::FileSystem to create spill WriteFile.
   std::string fileCreateConfig;
+
+  /// Enables block-level metadata recording for sorted spill files. This is
+  /// disabled by default to preserve existing spill behavior.
+  bool indexedSpillEnabled{false};
 
   // spill direct with row format
   RowBasedSpillMode rowBasedSpillMode{RowBasedSpillMode::DISABLE};

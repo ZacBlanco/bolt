@@ -31,6 +31,8 @@
 #include "bolt/exec/OrderBy.h"
 
 #include "bolt/exec/OperatorUtils.h"
+#include "bolt/exec/ParallelSortBuffer.h"
+#include "bolt/exec/SortBuffer.h"
 #include "bolt/exec/Task.h"
 #include "bolt/vector/FlatVector.h"
 #include "exec/OperatorMetric.h"
@@ -82,17 +84,34 @@ OrderBy::OrderBy(
   auto hybridSortEnabled = driverCtx->queryConfig().hybridSortEnabled();
   auto scatteredModeEnabled =
       driverCtx->queryConfig().hybridSortScatteredModeEnabled();
-  sortBuffer_ = std::make_unique<SortBuffer>(
-      outputType_,
-      sortColumnIndices,
-      sortCompareFlags,
-      pool(),
-      &nonReclaimableSection_,
-      spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr,
-      operatorCtx_->driverCtx()->queryConfig().orderBySpillMemoryThreshold(),
-      operatorCtx_.get(),
-      hybridSortEnabled,
-      scatteredModeEnabled);
+  if (driverCtx->queryConfig().orderByParallelSortEnabled()) {
+    sortBuffer_ = std::make_unique<ParallelSortBuffer>(
+        outputType_,
+        sortColumnIndices,
+        sortCompareFlags,
+        pool(),
+        driverCtx->queryConfig().orderByParallelMergeTargetRows(),
+        driverCtx->queryConfig().orderByParallelMergeLookaheadTasks(),
+        operatorCtx_->task()->queryCtx()->executor(),
+        &nonReclaimableSection_,
+        spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr,
+        operatorCtx_->driverCtx()->queryConfig().orderBySpillMemoryThreshold(),
+        driverCtx->queryConfig().orderByParallelMergeThreads(),
+        driverCtx->queryConfig().enableJitRowCmpRow());
+    addRuntimeStat("parallelSortBufferUsed", RuntimeCounter(1));
+  } else {
+    sortBuffer_ = std::make_unique<SortBuffer>(
+        outputType_,
+        sortColumnIndices,
+        sortCompareFlags,
+        pool(),
+        &nonReclaimableSection_,
+        spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr,
+        operatorCtx_->driverCtx()->queryConfig().orderBySpillMemoryThreshold(),
+        operatorCtx_.get(),
+        hybridSortEnabled,
+        scatteredModeEnabled);
+  }
 
   this->setRuntimeMetric(
       OperatorMetricKey::kCanUsedToEstimateHashBuildPartitionNum, "true");
@@ -115,7 +134,7 @@ void OrderBy::reclaim(
 
   // TODO: support fine-grain disk spilling based on 'targetBytes' after
   // having row container memory compaction support later.
-  sortBuffer_->spill();
+  sortBuffer_->reclaim(targetBytes);
 
   // Release the minimum reserved memory.
   pool()->release();
@@ -148,6 +167,7 @@ RowVectorPtr OrderBy::getOutput() {
   if (finished_) {
     recordSpillReadStats();
     recordSortStats();
+    recordParallelSortStats();
   }
 
   this->setRuntimeMetric(
@@ -185,6 +205,116 @@ void OrderBy::recordSortStats() {
   if (sortStatsOr.has_value()) {
     Operator::recordSortStats(sortStatsOr.value());
   }
+}
+
+void OrderBy::recordParallelSortStats() {
+  auto* parallelBuffer = dynamic_cast<ParallelSortBuffer*>(sortBuffer_.get());
+  if (parallelBuffer == nullptr) {
+    return;
+  }
+
+  const auto stats = parallelBuffer->debugStats();
+  auto lockedStats = stats_.wlock();
+  lockedStats->addRuntimeStat(
+      "parallelInputRunTargetBytes", RuntimeCounter(stats.inputRunTargetBytes));
+  lockedStats->addRuntimeStat(
+      "parallelInputRunsCreated", RuntimeCounter(stats.inputRunsCreated));
+  lockedStats->addRuntimeStat(
+      "parallelInputRunsScheduledSync",
+      RuntimeCounter(stats.inputRunsScheduledSync));
+  lockedStats->addRuntimeStat(
+      "parallelInputRunsScheduledAsync",
+      RuntimeCounter(stats.inputRunsScheduledAsync));
+  lockedStats->addRuntimeStat(
+      "parallelMaxPendingInputRuns", RuntimeCounter(stats.maxPendingInputRuns));
+  lockedStats->addRuntimeStat(
+      "parallelMaxRunningInputRuns", RuntimeCounter(stats.maxRunningInputRuns));
+  lockedStats->addRuntimeStat(
+      "parallelInputRunCollects", RuntimeCounter(stats.inputRunCollects));
+  lockedStats->addRuntimeStat(
+      "parallelInputRunWaitTime",
+      RuntimeCounter(
+          static_cast<int64_t>(stats.inputRunWaitTimeUs * 1'000),
+          RuntimeCounter::Unit::kNanos));
+  lockedStats->addRuntimeStat(
+      "parallelSpillRunsScheduled", RuntimeCounter(stats.spillRunsScheduled));
+  lockedStats->addRuntimeStat(
+      "parallelMaxRunningSpillRuns", RuntimeCounter(stats.maxRunningSpillRuns));
+  lockedStats->addRuntimeStat(
+      "parallelMergeTargetRows", RuntimeCounter(stats.mergeTargetRows));
+  lockedStats->addRuntimeStat(
+      "parallelMergeTasks", RuntimeCounter(stats.mergeTasks));
+  lockedStats->addRuntimeStat(
+      "parallelMergeTaskLookahead", RuntimeCounter(stats.mergeTaskLookahead));
+  lockedStats->addRuntimeStat(
+      "parallelMergeBatchesScheduled",
+      RuntimeCounter(stats.mergeBatchesScheduled));
+  lockedStats->addRuntimeStat(
+      "parallelMergeBatchesCompleted",
+      RuntimeCounter(stats.mergeBatchesCompleted));
+  lockedStats->addRuntimeStat(
+      "parallelMaxRunningMergeBatches",
+      RuntimeCounter(stats.maxRunningMergeBatches));
+  lockedStats->addRuntimeStat(
+      "parallelMaxActiveMergeTasks", RuntimeCounter(stats.maxActiveMergeTasks));
+  lockedStats->addRuntimeStat(
+      "parallelMaxBufferedOutputRows",
+      RuntimeCounter(stats.maxBufferedOutputRows));
+  lockedStats->addRuntimeStat(
+      "parallelEstimatedInputRowBytes",
+      RuntimeCounter(stats.estimatedInputRowBytes));
+  lockedStats->addRuntimeStat(
+      "parallelMergePlanningTime",
+      RuntimeCounter(
+          static_cast<int64_t>(stats.mergePlanningTimeUs * 1'000),
+          RuntimeCounter::Unit::kNanos));
+  lockedStats->addRuntimeStat(
+      "parallelMergeBoundaryPlanningTime",
+      RuntimeCounter(
+          static_cast<int64_t>(stats.mergeBoundaryPlanningTimeUs * 1'000),
+          RuntimeCounter::Unit::kNanos));
+  lockedStats->addRuntimeStat(
+      "parallelMergeTaskBuildTime",
+      RuntimeCounter(
+          static_cast<int64_t>(stats.mergeTaskBuildTimeUs * 1'000),
+          RuntimeCounter::Unit::kNanos));
+  lockedStats->addRuntimeStat(
+      "parallelMergePlanningTotalRowsTime",
+      RuntimeCounter(
+          static_cast<int64_t>(stats.mergePlanningTotalRowsTimeUs * 1'000),
+          RuntimeCounter::Unit::kNanos));
+  lockedStats->addRuntimeStat(
+      "parallelMergePlanningBoundaryIterations",
+      RuntimeCounter(stats.mergePlanningBoundaryIterations));
+  lockedStats->addRuntimeStat(
+      "parallelMergePlanningCursorComparisons",
+      RuntimeCounter(stats.mergePlanningCursorComparisons));
+  lockedStats->addRuntimeStat(
+      "parallelMergePlanningRowReferenceLoads",
+      RuntimeCounter(stats.mergePlanningRowReferenceLoads));
+  lockedStats->addRuntimeStat(
+      "parallelMergePlanningBoundaries",
+      RuntimeCounter(stats.mergePlanningBoundaries));
+  lockedStats->addRuntimeStat(
+      "parallelMergeExecutionTime",
+      RuntimeCounter(
+          static_cast<int64_t>(stats.mergeExecutionTimeUs * 1'000),
+          RuntimeCounter::Unit::kNanos));
+  lockedStats->addRuntimeStat(
+      "parallelMergeWaitTime",
+      RuntimeCounter(
+          static_cast<int64_t>(stats.mergeWaitTimeUs * 1'000),
+          RuntimeCounter::Unit::kNanos));
+  lockedStats->addRuntimeStat(
+      "parallelMergeOutputQueueTime",
+      RuntimeCounter(
+          static_cast<int64_t>(stats.mergeOutputQueueTimeUs * 1'000),
+          RuntimeCounter::Unit::kNanos));
+  lockedStats->addRuntimeStat(
+      "parallelOutputProjectionTime",
+      RuntimeCounter(
+          static_cast<int64_t>(stats.outputProjectionTimeUs * 1'000),
+          RuntimeCounter::Unit::kNanos));
 }
 
 } // namespace bytedance::bolt::exec

@@ -32,7 +32,9 @@
 
 #include <folly/container/F14Set.h>
 #include <cstdint>
+#include <deque>
 #include <optional>
+#include <unordered_map>
 
 #include "bolt/common/base/SpillConfig.h"
 #include "bolt/common/base/SpillStats.h"
@@ -53,6 +55,11 @@ using SpillSortKey = std::pair<column_index_t, CompareFlags>;
 /// file.
 class SpillWriteFile {
  public:
+  struct WriteBlockResult {
+    uint64_t offset{0};
+    uint64_t bytes{0};
+  };
+
   static std::unique_ptr<SpillWriteFile> create(
       uint32_t id,
       const std::string& pathPrefix,
@@ -73,6 +80,10 @@ class SpillWriteFile {
   uint64_t write(std::unique_ptr<folly::IOBuf> iobuf);
 
   uint64_t write(std::string_view buf);
+
+  WriteBlockResult writeBlock(std::unique_ptr<folly::IOBuf> iobuf);
+
+  WriteBlockResult writeBlock(std::string_view buf);
 
   WriteFile* file() {
     return file_.get();
@@ -98,12 +109,22 @@ class SpillWriteFile {
   std::unique_ptr<WriteFile> file_;
   // Byte size of the backing file. Set when finishing writing.
   uint64_t size_{0};
+  // Logical byte size including writes that may still be pending in io_uring.
+  uint64_t logicalSize_{0};
   std::atomic_uint64_t taskId_{0};
   bool spillUringEnabled_;
 
   // Write buffers to maintain the lifecycle of data to be written via io_uring,
   // since the data must remain valid until completion of uring write.
   std::shared_ptr<WriteBuffers> writeBuffers_;
+};
+
+/// Block-level metadata for a contiguous serialized region inside a spill file.
+struct SpillBlockInfo {
+  uint64_t offset{0};
+  uint64_t size{0};
+  uint64_t rowOffset{0};
+  uint64_t rowCount{0};
 };
 
 /// Records info of a finished spill file which is used for read.
@@ -115,6 +136,7 @@ struct SpillFileInfo {
   uint64_t size;
   uint64_t rowCount;
   std::vector<SpillSortKey> sortingKeys;
+  std::vector<SpillBlockInfo> blocks;
   common::CompressionKind compressionKind;
   std::optional<VectorSerde::Kind> serdeKind;
   std::optional<RowFormatInfo> rowInfo;
@@ -202,7 +224,11 @@ class SpillWriter {
 
   // Writes data from 'batch_' to the current output file. Returns the actual
   // written size.
-  uint64_t flush();
+  uint64_t flush(uint64_t blockRows = 0);
+
+  void recordBlock(
+      const SpillWriteFile::WriteBlockResult& block,
+      uint64_t rowCount);
 
   // Invoked to increment the number of spilled files and the file size.
   void updateSpilledFileStats(uint64_t fileSize);
@@ -236,6 +262,7 @@ class SpillWriter {
   uint32_t nextFileId_{0};
   std::unique_ptr<VectorStreamGroup> batch_;
   std::unique_ptr<SpillWriteFile> currentFile_;
+  std::vector<SpillBlockInfo> currentFileBlocks_;
   SpillFiles finishedFiles_;
   uint32_t maxBatchRows_{0};
   uint32_t unflushedRows_{0};
@@ -243,8 +270,10 @@ class SpillWriter {
 
   std::optional<RowFormatInfo> rowInfo_;
   const std::optional<VectorSerde::Kind> spillSerdeKind_;
+  const bool indexedSpillEnabled_;
   VectorSerde* serde_{nullptr};
   uint64_t rowsInCurrentFile_{0};
+  uint64_t indexedRowsInCurrentFile_{0};
 };
 
 /// Input stream backed by spill file.
@@ -391,6 +420,58 @@ class SpillReadFile : public SpillReadFileBase {
 
   void reuse();
   bool nextBatch(RowVectorPtr& rowVector);
+};
+
+/// Random-access reader for indexed row-vector spill files. The reader uses
+/// SpillBlockInfo metadata to locate the serialized block containing a row
+/// ordinal, reads only that block, and keeps a small bounded block cache.
+class IndexedSpillReadFile {
+ public:
+  struct RowReference {
+    RowVectorPtr batch;
+    vector_size_t index{0};
+  };
+
+  static std::unique_ptr<IndexedSpillReadFile> create(
+      const SpillFileInfo& fileInfo,
+      memory::MemoryPool* pool,
+      size_t maxCachedBlocks = 2);
+
+  RowReference rowAt(uint64_t ordinal);
+
+  size_t blockIndexForRow(uint64_t ordinal) const;
+
+  uint64_t rowCount() const {
+    return fileInfo_.rowCount;
+  }
+
+  uint64_t getSpillReadIOTime() const {
+    return spillReadIOTimeUs_;
+  }
+
+  size_t cachedBlocks() const {
+    return blockCache_.size();
+  }
+
+  void clearCache();
+
+ private:
+  IndexedSpillReadFile(
+      const SpillFileInfo& fileInfo,
+      memory::MemoryPool* pool,
+      size_t maxCachedBlocks);
+
+  RowVectorPtr readBlock(size_t blockIndex);
+
+  SpillFileInfo fileInfo_;
+  memory::MemoryPool* const pool_;
+  const size_t maxCachedBlocks_;
+  const VectorSerde::Options readOptions_;
+  VectorSerde* const serde_{nullptr};
+  std::unique_ptr<ReadFile> file_;
+  std::unordered_map<size_t, RowVectorPtr> blockCache_;
+  std::deque<size_t> blockCacheOrder_;
+  uint64_t spillReadIOTimeUs_{0};
 };
 
 class RowBasedSpillReadFile : public SpillReadFileBase {

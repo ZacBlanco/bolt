@@ -38,6 +38,7 @@
 #include "bolt/common/file/FileSystems.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/Spill.h"
+#include "bolt/exec/SpilledSortedRun.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
 #include "bolt/serializers/PrestoSerializer.h"
 #include "bolt/type/Timestamp.h"
@@ -590,6 +591,230 @@ TEST_P(SpillTest, spillPartitionId) {
         spillPartitionIds.begin(), spillPartitionIds.end());
     ASSERT_EQ(partitionIdSet.size(), distinctSpillPartitionIds.size());
   }
+}
+
+TEST_P(SpillTest, indexedSpillMetadataRecordsVectorBlocks) {
+  auto tempDirectory = exec::test::TempDirectoryPath::create();
+  common::SpillConfig::SpillIOConfig ioConfig{
+      .getSpillDirPathCb = [&]() -> const std::string& {
+        return tempDirectory->path;
+      },
+      .updateAndCheckSpillLimitCb = updateSpilledBytesCb_,
+      .fileNamePrefix = "test",
+      .maxFileSize = 0,
+      .spillUringEnabled = false,
+      .writeBufferSize = 0,
+      .compressionKind = compressionKind_,
+      .fileCreateConfig = "",
+      .spillSerdeKind = std::optional<VectorSerde::Kind>{},
+      .indexedSpillEnabled = true};
+  SpillState state(
+      ioConfig,
+      1,
+      SpillState::makeSortingKeys(std::vector<CompareFlags>(1)),
+      1'000'000,
+      pool(),
+      &stats_);
+  state.setMaxBatchRows(3);
+  state.setPartitionSpilled(0);
+
+  state.appendToPartition(
+      0, makeRowVector({makeFlatVector<int64_t>({1, 2, 3})}));
+  state.appendToPartition(0, makeRowVector({makeFlatVector<int64_t>({4, 5})}));
+
+  auto files = state.finish(0);
+  ASSERT_EQ(files.size(), 1);
+  ASSERT_EQ(files[0].rowCount, 5);
+  ASSERT_EQ(files[0].blocks.size(), 2);
+
+  EXPECT_EQ(files[0].blocks[0].offset, 0);
+  EXPECT_GT(files[0].blocks[0].size, 0);
+  EXPECT_EQ(files[0].blocks[0].rowOffset, 0);
+  EXPECT_EQ(files[0].blocks[0].rowCount, 3);
+
+  EXPECT_EQ(files[0].blocks[1].offset, files[0].blocks[0].size);
+  EXPECT_GT(files[0].blocks[1].size, 0);
+  EXPECT_EQ(files[0].blocks[1].rowOffset, 3);
+  EXPECT_EQ(files[0].blocks[1].rowCount, 2);
+  EXPECT_EQ(files[0].size, files[0].blocks[0].size + files[0].blocks[1].size);
+}
+
+TEST_P(SpillTest, spilledSortedRunReadsSequentially) {
+  auto tempDirectory = exec::test::TempDirectoryPath::create();
+  stats_.wlock()->reset();
+
+  const auto type = ROW({"c0", "c1"}, {BIGINT(), VARCHAR()});
+  RowContainer container({BIGINT()}, {VARCHAR()}, true, pool());
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>({4, 1, 7, 3, 2, 6, 5}),
+       makeFlatVector<std::string>(
+           {"four", "one", "seven", "three", "two", "six", "five"})});
+  container.store(input);
+
+  std::vector<char*> rows(container.numRows());
+  RowContainerIterator iter;
+  ASSERT_EQ(container.listRows(&iter, rows.size(), rows.data()), rows.size());
+  const std::vector<CompareFlags> compareFlags{
+      {true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}};
+  std::sort(rows.begin(), rows.end(), [&](const char* left, const char* right) {
+    return container.compareRows(left, right, compareFlags) < 0;
+  });
+
+  common::SpillConfig::SpillIOConfig ioConfig{
+      .getSpillDirPathCb = [&]() -> const std::string& {
+        return tempDirectory->path;
+      },
+      .updateAndCheckSpillLimitCb = updateSpilledBytesCb_,
+      .fileNamePrefix = "test",
+      .maxFileSize = 0,
+      .spillUringEnabled = false,
+      .writeBufferSize = 0,
+      .compressionKind = compressionKind_,
+      .fileCreateConfig = "",
+      .spillSerdeKind = std::optional<VectorSerde::Kind>{},
+      .indexedSpillEnabled = true};
+
+  auto run = SpilledSortedRun::create(
+      11,
+      type,
+      container,
+      rows,
+      compareFlags,
+      ioConfig,
+      1'000'000,
+      pool(),
+      &stats_,
+      3);
+
+  ASSERT_EQ(run->id(), 11);
+  ASSERT_TRUE(run->spilled());
+  ASSERT_EQ(run->numRows(), 7);
+  ASSERT_TRUE(run->hasIndexedBlocks());
+  ASSERT_EQ(run->files().size(), 1);
+  ASSERT_EQ(run->files()[0].sortingKeys.size(), 1);
+  ASSERT_EQ(run->files()[0].blocks.size(), 3);
+  ASSERT_EQ(run->files()[0].blocks[0].rowCount, 3);
+  ASSERT_EQ(run->files()[0].blocks[1].rowCount, 3);
+  ASSERT_EQ(run->files()[0].blocks[2].rowCount, 1);
+
+  std::vector<int64_t> actualKeys;
+  std::vector<std::string> actualPayloads;
+  RowVectorPtr batch;
+  while (run->nextBatch(batch)) {
+    auto keys = batch->childAt(0)->asUnchecked<FlatVector<int64_t>>();
+    auto payloads = batch->childAt(1)->asUnchecked<FlatVector<StringView>>();
+    for (auto row = 0; row < batch->size(); ++row) {
+      actualKeys.push_back(keys->valueAt(row));
+      actualPayloads.push_back(payloads->valueAt(row).str());
+    }
+  }
+
+  ASSERT_EQ(actualKeys, std::vector<int64_t>({1, 2, 3, 4, 5, 6, 7}));
+  ASSERT_EQ(
+      actualPayloads,
+      std::vector<std::string>(
+          {"one", "two", "three", "four", "five", "six", "seven"}));
+  const auto stats = stats_.copy();
+  ASSERT_EQ(stats.spilledRows, 7);
+  ASSERT_GT(stats.spilledBytes, 0);
+  ASSERT_EQ(stats.spilledFiles, 1);
+  ASSERT_EQ(stats.spillWrites, 3);
+
+  run->resetSequentialReader();
+  ASSERT_TRUE(run->nextBatch(batch));
+  ASSERT_EQ(batch->size(), 3);
+  ASSERT_EQ(
+      batch->childAt(0)->asUnchecked<FlatVector<int64_t>>()->valueAt(0), 1);
+}
+
+TEST_P(SpillTest, spilledSortedRunIndexedRandomAccessAndLowerBound) {
+  auto tempDirectory = exec::test::TempDirectoryPath::create();
+  stats_.wlock()->reset();
+
+  const auto type = ROW({"c0", "c1"}, {BIGINT(), VARCHAR()});
+  RowContainer container({BIGINT()}, {VARCHAR()}, true, pool());
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>({3, 1, 7, 3, 2, 6, 5, 4, 3}),
+       makeFlatVector<std::string>(
+           {"three-a",
+            "one",
+            "seven",
+            "three-b",
+            "two",
+            "six",
+            "five",
+            "four",
+            "three-c"})});
+  container.store(input);
+
+  std::vector<char*> rows(container.numRows());
+  RowContainerIterator iter;
+  ASSERT_EQ(container.listRows(&iter, rows.size(), rows.data()), rows.size());
+  const std::vector<CompareFlags> compareFlags{
+      {true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}};
+  std::stable_sort(
+      rows.begin(), rows.end(), [&](const char* left, const char* right) {
+        return container.compareRows(left, right, compareFlags) < 0;
+      });
+
+  common::SpillConfig::SpillIOConfig ioConfig{
+      .getSpillDirPathCb = [&]() -> const std::string& {
+        return tempDirectory->path;
+      },
+      .updateAndCheckSpillLimitCb = updateSpilledBytesCb_,
+      .fileNamePrefix = "test",
+      .maxFileSize = 0,
+      .spillUringEnabled = false,
+      .writeBufferSize = 0,
+      .compressionKind = compressionKind_,
+      .fileCreateConfig = "",
+      .spillSerdeKind = std::optional<VectorSerde::Kind>{},
+      .indexedSpillEnabled = true};
+
+  auto run = SpilledSortedRun::create(
+      12,
+      type,
+      container,
+      rows,
+      compareFlags,
+      ioConfig,
+      1'000'000,
+      pool(),
+      &stats_,
+      3);
+  ASSERT_EQ(run->numRows(), 9);
+  ASSERT_EQ(run->files()[0].blocks.size(), 3);
+
+  auto first = run->rowAt(0);
+  auto middle = run->rowAt(4);
+  auto last = run->rowAt(8);
+  ASSERT_EQ(
+      first.batch->childAt(0)->asUnchecked<FlatVector<int64_t>>()->valueAt(
+          first.index),
+      1);
+  ASSERT_EQ(
+      middle.batch->childAt(0)->asUnchecked<FlatVector<int64_t>>()->valueAt(
+          middle.index),
+      3);
+  ASSERT_EQ(
+      last.batch->childAt(0)->asUnchecked<FlatVector<int64_t>>()->valueAt(
+          last.index),
+      7);
+  ASSERT_LE(run->testingCachedBlocks(), 2);
+  ASSERT_LT(run->compare(0, 8), 0);
+
+  auto probes = makeRowVector(
+      {makeFlatVector<int64_t>({0, 3, 8}),
+       makeFlatVector<std::string>({"", "", ""})});
+  ASSERT_EQ(run->lowerBound(probes, 0), 0);
+  ASSERT_EQ(run->lowerBound(probes, 1), 2);
+  ASSERT_EQ(run->lowerBound(probes, 2), 9);
+
+  auto corruptFiles = run->files();
+  corruptFiles[0].blocks.clear();
+  SpilledSortedRun corruptRun(13, std::move(corruptFiles), pool());
+  BOLT_ASSERT_THROW(
+      corruptRun.rowAt(0), "Indexed spill file requires block metadata");
 }
 
 TEST_P(SpillTest, spillPartitionSet) {

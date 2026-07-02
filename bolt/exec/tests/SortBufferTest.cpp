@@ -33,6 +33,12 @@
 
 #include "bolt/common/base/tests/GTestUtils.h"
 #include "bolt/common/file/FileSystems.h"
+#include "bolt/core/QueryConfig.h"
+#include "bolt/exec/ISortBuffer.h"
+#include "bolt/exec/MergePath.h"
+#include "bolt/exec/ParallelSortBuffer.h"
+#include "bolt/exec/SortedRun.h"
+#include "bolt/exec/SpilledSortedRun.h"
 #include "bolt/exec/tests/utils/OperatorTestBase.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
 #include "bolt/type/Type.h"
@@ -80,6 +86,138 @@ class SortBufferTest : public OperatorTestBase {
         "none");
   }
 
+  std::unique_ptr<InMemorySortedRun> makeBigintMemoryRun(
+      uint32_t id,
+      const std::vector<int64_t>& values) {
+    auto container = std::make_unique<RowContainer>(
+        std::vector<TypePtr>{BIGINT()},
+        std::vector<TypePtr>{},
+        true,
+        pool_.get());
+    container->store(makeRowVector({makeFlatVector<int64_t>(values)}));
+    return InMemorySortedRun::createSorted(
+        id,
+        std::move(container),
+        {{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}});
+  }
+
+  std::unique_ptr<SpilledSortedRun> makeBigintSpilledRun(
+      uint32_t id,
+      const std::vector<int64_t>& values,
+      const std::string& spillDir,
+      uint32_t maxRowsPerBlock = 2) {
+    RowContainer container(
+        std::vector<TypePtr>{BIGINT()},
+        std::vector<TypePtr>{},
+        true,
+        pool_.get());
+    container.store(makeRowVector({makeFlatVector<int64_t>(values)}));
+
+    std::vector<char*> rows(container.numRows());
+    RowContainerIterator iter;
+    container.listRows(&iter, rows.size(), rows.data());
+
+    common::SpillConfig::SpillIOConfig ioConfig{
+        .getSpillDirPathCb = [&]() -> const std::string& { return spillDir; },
+        .updateAndCheckSpillLimitCb = [&](uint64_t) {},
+        .fileNamePrefix = "merge-path-test",
+        .maxFileSize = 0,
+        .spillUringEnabled = false,
+        .writeBufferSize = 0,
+        .compressionKind = common::CompressionKind::CompressionKind_NONE,
+        .fileCreateConfig = "",
+        .spillSerdeKind = std::optional<VectorSerde::Kind>{},
+        .indexedSpillEnabled = true};
+    return SpilledSortedRun::create(
+        id,
+        ROW({"c0"}, {BIGINT()}),
+        container,
+        rows,
+        {{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}},
+        ioConfig,
+        1'000'000,
+        pool_.get(),
+        &spillStats_,
+        maxRowsPerBlock);
+  }
+
+  std::unique_ptr<InMemorySortedRun> makeBigintPayloadMemoryRun(
+      uint32_t id,
+      const std::vector<int64_t>& keys) {
+    auto container = std::make_unique<RowContainer>(
+        std::vector<TypePtr>{BIGINT()},
+        std::vector<TypePtr>{BIGINT()},
+        true,
+        pool_.get());
+    std::vector<int64_t> payloads;
+    payloads.reserve(keys.size());
+    for (size_t ordinal = 0; ordinal < keys.size(); ++ordinal) {
+      payloads.push_back(id * 1'000 + ordinal);
+    }
+    container->store(makeRowVector(
+        {makeFlatVector<int64_t>(keys), makeFlatVector<int64_t>(payloads)}));
+
+    std::vector<char*> rows(container->numRows());
+    if (!rows.empty()) {
+      RowContainerIterator iter;
+      container->listRows(&iter, rows.size(), rows.data());
+    }
+    return std::make_unique<InMemorySortedRun>(
+        id,
+        std::move(container),
+        std::move(rows),
+        std::vector<CompareFlags>{
+            {true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}});
+  }
+
+  std::unique_ptr<SpilledSortedRun> makeBigintPayloadSpilledRun(
+      uint32_t id,
+      const std::vector<int64_t>& keys,
+      const std::string& spillDir,
+      uint32_t maxRowsPerBlock = 2) {
+    RowContainer container(
+        std::vector<TypePtr>{BIGINT()},
+        std::vector<TypePtr>{BIGINT()},
+        true,
+        pool_.get());
+    std::vector<int64_t> payloads;
+    payloads.reserve(keys.size());
+    for (size_t ordinal = 0; ordinal < keys.size(); ++ordinal) {
+      payloads.push_back(id * 1'000 + ordinal);
+    }
+    container.store(makeRowVector(
+        {makeFlatVector<int64_t>(keys), makeFlatVector<int64_t>(payloads)}));
+
+    std::vector<char*> rows(container.numRows());
+    if (!rows.empty()) {
+      RowContainerIterator iter;
+      container.listRows(&iter, rows.size(), rows.data());
+    }
+
+    common::SpillConfig::SpillIOConfig ioConfig{
+        .getSpillDirPathCb = [&]() -> const std::string& { return spillDir; },
+        .updateAndCheckSpillLimitCb = [&](uint64_t) {},
+        .fileNamePrefix = "merge-path-payload-test",
+        .maxFileSize = 0,
+        .spillUringEnabled = false,
+        .writeBufferSize = 0,
+        .compressionKind = common::CompressionKind::CompressionKind_NONE,
+        .fileCreateConfig = "",
+        .spillSerdeKind = std::optional<VectorSerde::Kind>{},
+        .indexedSpillEnabled = true};
+    return SpilledSortedRun::create(
+        id,
+        ROW({"c0", "payload"}, {BIGINT(), BIGINT()}),
+        container,
+        rows,
+        {{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}},
+        ioConfig,
+        1'000'000,
+        pool_.get(),
+        &spillStats_,
+        maxRowsPerBlock);
+  }
+
   const RowTypePtr inputType_ = ROW(
       {{"c0", BIGINT()},
        {"c1", INTEGER()},
@@ -97,9 +235,97 @@ class SortBufferTest : public OperatorTestBase {
       std::make_shared<folly::CPUThreadPoolExecutor>(
           std::thread::hardware_concurrency())};
 
+  folly::Synchronized<common::SpillStats> spillStats_;
   tsan_atomic<bool> nonReclaimableSection_{false};
   folly::Random::DefaultGenerator rng_;
 };
+
+namespace {
+
+struct MergePathEntry {
+  int64_t key;
+  uint32_t runId;
+  uint64_t ordinal;
+
+  bool operator==(const MergePathEntry& other) const {
+    return key == other.key && runId == other.runId && ordinal == other.ordinal;
+  }
+};
+
+bool mergePathEntryLess(
+    const MergePathEntry& left,
+    const MergePathEntry& right) {
+  return std::tie(left.key, left.runId, left.ordinal) <
+      std::tie(right.key, right.runId, right.ordinal);
+}
+
+std::vector<MergePathEntry> mergedReference(
+    const std::vector<std::vector<int64_t>>& runValues,
+    const std::vector<uint32_t>& runIds) {
+  std::vector<MergePathEntry> reference;
+  for (size_t runIndex = 0; runIndex < runValues.size(); ++runIndex) {
+    for (size_t ordinal = 0; ordinal < runValues[runIndex].size(); ++ordinal) {
+      reference.push_back(MergePathEntry{
+          .key = runValues[runIndex][ordinal],
+          .runId = runIds[runIndex],
+          .ordinal = ordinal});
+    }
+  }
+  std::sort(reference.begin(), reference.end(), mergePathEntryLess);
+  return reference;
+}
+
+void assertMergeTasksMatchReference(
+    const std::vector<MergeTask>& tasks,
+    const std::vector<std::vector<int64_t>>& runValues,
+    const std::vector<uint32_t>& runIds,
+    uint64_t targetRowsPerTask) {
+  const auto reference = mergedReference(runValues, runIds);
+  std::vector<uint64_t> previousOffsets(runValues.size(), 0);
+  uint64_t expectedOutputBegin = 0;
+
+  for (const auto& task : tasks) {
+    ASSERT_EQ(task.outputBegin, expectedOutputBegin);
+    ASSERT_LE(task.outputEnd, reference.size());
+    ASSERT_EQ(task.outputSize(), task.outputEnd - task.outputBegin);
+    if (task.outputEnd != reference.size()) {
+      ASSERT_EQ(task.outputSize(), targetRowsPerTask);
+    }
+
+    uint64_t sliceRows = 0;
+    std::vector<MergePathEntry> actualTaskRows;
+    for (const auto& slice : task.slices) {
+      ASSERT_LT(slice.runIndex, runValues.size());
+      ASSERT_EQ(slice.runId, runIds[slice.runIndex]);
+      ASSERT_EQ(slice.begin, previousOffsets[slice.runIndex]);
+      ASSERT_LE(slice.end, runValues[slice.runIndex].size());
+      previousOffsets[slice.runIndex] = slice.end;
+      sliceRows += slice.size();
+      for (auto ordinal = slice.begin; ordinal < slice.end; ++ordinal) {
+        actualTaskRows.push_back(MergePathEntry{
+            .key = runValues[slice.runIndex][ordinal],
+            .runId = slice.runId,
+            .ordinal = ordinal});
+      }
+    }
+    ASSERT_EQ(sliceRows, task.outputSize());
+    std::sort(actualTaskRows.begin(), actualTaskRows.end(), mergePathEntryLess);
+
+    const auto expectedBegin = reference.begin() + task.outputBegin;
+    const auto expectedEnd = reference.begin() + task.outputEnd;
+    ASSERT_EQ(
+        actualTaskRows,
+        std::vector<MergePathEntry>(expectedBegin, expectedEnd));
+    expectedOutputBegin = task.outputEnd;
+  }
+
+  ASSERT_EQ(expectedOutputBegin, reference.size());
+  for (size_t runIndex = 0; runIndex < runValues.size(); ++runIndex) {
+    ASSERT_EQ(previousOffsets[runIndex], runValues[runIndex].size());
+  }
+}
+
+} // namespace
 
 TEST_F(SortBufferTest, singleKey) {
   struct {
@@ -182,6 +408,375 @@ TEST_F(SortBufferTest, singleKey) {
           expectedValue);
     }
   }
+}
+
+TEST_F(SortBufferTest, parallelSortQueryConfigDefaults) {
+  const core::QueryConfig config({});
+
+  ASSERT_FALSE(config.orderByParallelSortEnabled());
+  ASSERT_EQ(0, config.orderByParallelMergeThreads());
+  ASSERT_EQ(0, config.orderByParallelMergeTargetRows());
+  ASSERT_EQ(2, config.orderByParallelMergeLookaheadTasks());
+  ASSERT_EQ(4UL << 10, config.orderByIndexedSpillBlockRows());
+  ASSERT_EQ(1UL << 20, config.orderByIndexedSpillBlockBytes());
+}
+
+TEST_F(SortBufferTest, parallelSortQueryConfigOverrides) {
+  const core::QueryConfig config({
+      {core::QueryConfig::kOrderByParallelSortEnabled, "true"},
+      {core::QueryConfig::kOrderByParallelMergeThreads, "7"},
+      {core::QueryConfig::kOrderByParallelMergeTargetRows, "12345"},
+      {core::QueryConfig::kOrderByParallelMergeLookaheadTasks, "3"},
+      {core::QueryConfig::kOrderByIndexedSpillBlockRows, "321"},
+      {core::QueryConfig::kOrderByIndexedSpillBlockBytes, "654321"},
+  });
+
+  ASSERT_TRUE(config.orderByParallelSortEnabled());
+  ASSERT_EQ(7, config.orderByParallelMergeThreads());
+  ASSERT_EQ(12345, config.orderByParallelMergeTargetRows());
+  ASSERT_EQ(3, config.orderByParallelMergeLookaheadTasks());
+  ASSERT_EQ(321, config.orderByIndexedSpillBlockRows());
+  ASSERT_EQ(654321, config.orderByIndexedSpillBlockBytes());
+}
+
+TEST_F(SortBufferTest, legacySortBufferImplementsISortBuffer) {
+  auto sortBuffer = std::make_unique<SortBuffer>(
+      inputType_,
+      sortColumnIndices_,
+      sortCompareFlags_,
+      pool_.get(),
+      &nonReclaimableSection_);
+
+  ISortBuffer* interface = sortBuffer.get();
+  ASSERT_EQ(0, interface->numInputRows());
+  ASSERT_EQ(0, interface->numOutputRows());
+  ASSERT_EQ(std::nullopt, interface->estimateOutputRowSize());
+}
+
+TEST_F(SortBufferTest, sortedRunPositionDefaults) {
+  const SortedRunPosition position;
+  ASSERT_EQ(0, position.runId);
+  ASSERT_EQ(0, position.ordinal);
+}
+
+TEST_F(SortBufferTest, inMemorySortedRunEmpty) {
+  auto container = std::make_unique<RowContainer>(
+      std::vector<TypePtr>{INTEGER()},
+      std::vector<TypePtr>{VARCHAR()},
+      true,
+      pool_.get());
+
+  auto run = InMemorySortedRun::createSorted(
+      11,
+      std::move(container),
+      {{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}});
+
+  ASSERT_EQ(11, run->id());
+  ASSERT_EQ(0, run->numRows());
+  ASSERT_FALSE(run->spilled());
+  ASSERT_TRUE(run->sortedRows().empty());
+}
+
+TEST_F(SortBufferTest, inMemorySortedRunSortsRows) {
+  auto container = std::make_unique<RowContainer>(
+      std::vector<TypePtr>{INTEGER()},
+      std::vector<TypePtr>{VARCHAR()},
+      true,
+      pool_.get());
+  container->store(makeRowVector(
+      {makeFlatVector<int32_t>({3, 1, 4, 2}),
+       makeFlatVector<std::string>({"three", "one", "four", "two"})}));
+
+  auto run = InMemorySortedRun::createSorted(
+      17,
+      std::move(container),
+      {{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}});
+
+  ASSERT_EQ(17, run->id());
+  ASSERT_EQ(4, run->numRows());
+  ASSERT_FALSE(run->spilled());
+  ASSERT_EQ(4, run->sortedRows().size());
+  ASSERT_LE(run->compare(0, 1), 0);
+  ASSERT_LE(run->compare(1, 2), 0);
+  ASSERT_LE(run->compare(2, 3), 0);
+
+  auto output = BaseVector::create(INTEGER(), run->numRows(), pool_.get());
+  run->container().extractColumn(
+      run->sortedRows().data(), run->numRows(), 0, output);
+  auto flatOutput = output->asFlatVector<int32_t>();
+  ASSERT_EQ(1, flatOutput->valueAt(0));
+  ASSERT_EQ(2, flatOutput->valueAt(1));
+  ASSERT_EQ(3, flatOutput->valueAt(2));
+  ASSERT_EQ(4, flatOutput->valueAt(3));
+}
+
+TEST_F(SortBufferTest, parallelSortBufferSerialMergeMultipleRuns) {
+  ParallelSortBuffer sortBuffer(
+      inputType_,
+      {1},
+      {{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}},
+      pool_.get());
+
+  sortBuffer.addInput(makeRowVector(
+      {makeFlatVector<int64_t>({1, 2, 3}),
+       makeFlatVector<int32_t>({6, 2, 4}),
+       makeFlatVector<int16_t>({1, 2, 3}),
+       makeFlatVector<float>({1.1, 2.2, 3.3}),
+       makeFlatVector<double>({1.1, 2.2, 3.3}),
+       makeFlatVector<std::string>({"six", "two", "four"})}));
+  sortBuffer.addInput(makeRowVector(
+      {makeFlatVector<int64_t>({4, 5, 6}),
+       makeFlatVector<int32_t>({5, 1, 3}),
+       makeFlatVector<int16_t>({4, 5, 6}),
+       makeFlatVector<float>({4.4, 5.5, 6.6}),
+       makeFlatVector<double>({4.4, 5.5, 6.6}),
+       makeFlatVector<std::string>({"five", "one", "three"})}));
+  sortBuffer.noMoreInput();
+
+  ASSERT_EQ(1, sortBuffer.numRuns());
+  ASSERT_EQ(6, sortBuffer.numInputRows());
+  ASSERT_NE(std::nullopt, sortBuffer.estimateOutputRowSize());
+
+  std::vector<int32_t> results;
+  while (auto output = sortBuffer.getOutput(2)) {
+    auto values = output->childAt(1)->asFlatVector<int32_t>();
+    for (auto i = 0; i < output->size(); ++i) {
+      results.push_back(values->valueAt(i));
+    }
+  }
+
+  ASSERT_EQ(results, std::vector<int32_t>({1, 2, 3, 4, 5, 6}));
+  ASSERT_EQ(6, sortBuffer.numOutputRows());
+  ASSERT_EQ(std::nullopt, sortBuffer.spilledStats());
+  ASSERT_EQ(std::nullopt, sortBuffer.spillReadStats());
+}
+
+TEST_F(SortBufferTest, MergePathBoundaryPlannerTwoRuns) {
+  std::vector<std::unique_ptr<InMemorySortedRun>> ownedRuns;
+  ownedRuns.push_back(makeBigintMemoryRun(0, {1, 3, 5, 7}));
+  ownedRuns.push_back(makeBigintMemoryRun(1, {2, 4, 6, 8}));
+
+  std::vector<SortedRun*> runs{ownedRuns[0].get(), ownedRuns[1].get()};
+  MergePathBoundaryPlanner planner(runs, pool_.get());
+  const auto tasks = planner.plan(3);
+
+  assertMergeTasksMatchReference(
+      tasks, {{1, 3, 5, 7}, {2, 4, 6, 8}}, {0, 1}, 3);
+}
+
+TEST_F(SortBufferTest, MergePathBoundaryPlannerDuplicateHeavyAndAllEqual) {
+  struct Scenario {
+    std::vector<std::vector<int64_t>> runs;
+    uint64_t targetRowsPerTask;
+  } scenarios[] = {
+      {{{1, 1, 1, 1, 1}, {2, 2, 2, 2, 2}}, 3},
+      {{{1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1}}, 5},
+      {{{1, 1, 2, 2, 2}, {1, 1, 1, 3}, {2, 2, 2, 2}}, 4}};
+
+  for (const auto& scenario : scenarios) {
+    std::vector<std::unique_ptr<InMemorySortedRun>> ownedRuns;
+    std::vector<SortedRun*> runs;
+    std::vector<uint32_t> runIds;
+    for (size_t i = 0; i < scenario.runs.size(); ++i) {
+      ownedRuns.push_back(makeBigintMemoryRun(i, scenario.runs[i]));
+      runs.push_back(ownedRuns.back().get());
+      runIds.push_back(i);
+    }
+
+    MergePathBoundaryPlanner planner(runs, pool_.get());
+    const auto tasks = planner.plan(scenario.targetRowsPerTask);
+    assertMergeTasksMatchReference(
+        tasks, scenario.runs, runIds, scenario.targetRowsPerTask);
+  }
+}
+
+TEST_F(SortBufferTest, MergePathBoundaryPlannerSkewedAndEmptyRuns) {
+  std::vector<std::vector<int64_t>> values = {
+      {}, {1}, {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, {}, {13, 14}};
+  std::vector<std::unique_ptr<InMemorySortedRun>> ownedRuns;
+  std::vector<SortedRun*> runs;
+  std::vector<uint32_t> runIds;
+  for (size_t i = 0; i < values.size(); ++i) {
+    ownedRuns.push_back(makeBigintMemoryRun(i, values[i]));
+    runs.push_back(ownedRuns.back().get());
+    runIds.push_back(i);
+  }
+
+  MergePathBoundaryPlanner planner(runs, pool_.get());
+  const auto tasks = planner.plan(4);
+  assertMergeTasksMatchReference(tasks, values, runIds, 4);
+}
+
+TEST_F(SortBufferTest, MergePathBoundaryPlannerMixedMemoryAndSpilledRuns) {
+  auto tempDirectory = exec::test::TempDirectoryPath::create();
+  std::vector<std::vector<int64_t>> values = {
+      {1, 1, 1, 4}, {1, 2, 2, 8}, {3, 3, 3, 3, 9}};
+
+  auto memoryRun0 = makeBigintMemoryRun(0, values[0]);
+  auto spilledRun1 = makeBigintSpilledRun(1, values[1], tempDirectory->path, 2);
+  auto memoryRun2 = makeBigintMemoryRun(2, values[2]);
+  std::vector<SortedRun*> runs{
+      memoryRun0.get(), spilledRun1.get(), memoryRun2.get()};
+
+  MergePathBoundaryPlanner planner(runs, pool_.get());
+  const auto tasks = planner.plan(3);
+  assertMergeTasksMatchReference(tasks, values, {0, 1, 2}, 3);
+}
+
+TEST_F(SortBufferTest, MergePathBoundaryPlannerRandomizedCornerCases) {
+  for (int iteration = 0; iteration < 100; ++iteration) {
+    const auto numRuns = 1 + folly::Random::rand32(6, rng_);
+    std::vector<std::vector<int64_t>> values(numRuns);
+    for (auto& run : values) {
+      const auto runSize = folly::Random::rand32(16, rng_);
+      run.reserve(runSize);
+      for (auto row = 0; row < runSize; ++row) {
+        // Small value domain intentionally creates duplicate-heavy and
+        // all-equal cases while the random run sizes cover empty and skewed
+        // runs.
+        run.push_back(folly::Random::rand32(4, rng_));
+      }
+      std::sort(run.begin(), run.end());
+    }
+
+    std::vector<std::unique_ptr<InMemorySortedRun>> ownedRuns;
+    std::vector<SortedRun*> runs;
+    std::vector<uint32_t> runIds;
+    for (size_t i = 0; i < values.size(); ++i) {
+      ownedRuns.push_back(makeBigintMemoryRun(i, values[i]));
+      runs.push_back(ownedRuns.back().get());
+      runIds.push_back(i);
+    }
+
+    MergePathBoundaryPlanner planner(runs, pool_.get());
+    const auto targetRowsPerTask = 1 + folly::Random::rand32(10, rng_);
+    const auto tasks = planner.plan(targetRowsPerTask);
+    assertMergeTasksMatchReference(tasks, values, runIds, targetRowsPerTask);
+  }
+}
+
+TEST_F(SortBufferTest, RunSliceReaderReadsBoundedSlices) {
+  auto tempDirectory = exec::test::TempDirectoryPath::create();
+  auto memoryRun = makeBigintMemoryRun(3, {1, 2, 3, 4});
+  auto spilledRun =
+      makeBigintSpilledRun(4, {10, 20, 30, 40, 50}, tempDirectory->path, 2);
+  const auto outputType = ROW({"c0"}, {BIGINT()});
+
+  RunSliceReader memoryReader(
+      memoryRun.get(),
+      MergeRunSlice{.runIndex = 0, .runId = 3, .begin = 1, .end = 3});
+  auto memoryOutput = std::static_pointer_cast<RowVector>(
+      BaseVector::create(outputType, 2, pool_.get()));
+  memoryOutput->childAt(0)->resize(2);
+  ASSERT_TRUE(memoryReader.hasNext());
+  ASSERT_EQ(memoryReader.currentOrdinal(), 1);
+  memoryReader.copyCurrentRowTo(memoryOutput, 0);
+  memoryReader.advance();
+  ASSERT_EQ(memoryReader.rowsRead(), 1);
+  memoryReader.copyCurrentRowTo(memoryOutput, 1);
+  memoryReader.advance();
+  ASSERT_FALSE(memoryReader.hasNext());
+  auto memoryValues = memoryOutput->childAt(0)->asFlatVector<int64_t>();
+  ASSERT_EQ(memoryValues->valueAt(0), 2);
+  ASSERT_EQ(memoryValues->valueAt(1), 3);
+
+  RunSliceReader spilledReader(
+      spilledRun.get(),
+      MergeRunSlice{.runIndex = 1, .runId = 4, .begin = 2, .end = 4});
+  auto spilledOutput = std::static_pointer_cast<RowVector>(
+      BaseVector::create(outputType, 2, pool_.get()));
+  spilledOutput->childAt(0)->resize(2);
+  spilledReader.copyCurrentRowTo(spilledOutput, 0);
+  spilledReader.advance();
+  spilledReader.copyCurrentRowTo(spilledOutput, 1);
+  spilledReader.advance();
+  ASSERT_EQ(spilledReader.rowsRead(), 2);
+  ASSERT_FALSE(spilledReader.hasNext());
+  auto spilledValues = spilledOutput->childAt(0)->asFlatVector<int64_t>();
+  ASSERT_EQ(spilledValues->valueAt(0), 30);
+  ASSERT_EQ(spilledValues->valueAt(1), 40);
+}
+
+TEST_F(SortBufferTest, parallelSortBufferParallelMergeEndToEnd) {
+  ParallelSortBuffer sortBuffer(
+      ROW({"key", "payload"}, {BIGINT(), BIGINT()}),
+      {0},
+      {{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}},
+      pool_.get(),
+      3,
+      2,
+      executor_.get());
+
+  sortBuffer.addInput(makeRowVector(
+      {makeFlatVector<int64_t>({5, 1, 3}),
+       makeFlatVector<int64_t>({50, 10, 30})}));
+  sortBuffer.addInput(makeRowVector(
+      {makeFlatVector<int64_t>({2, 6, 4}),
+       makeFlatVector<int64_t>({20, 60, 40})}));
+  sortBuffer.addInput(makeRowVector(
+      {makeFlatVector<int64_t>({0, 7}), makeFlatVector<int64_t>({0, 70})}));
+  sortBuffer.noMoreInput();
+
+  std::vector<int64_t> keys;
+  std::vector<int64_t> payloads;
+  std::vector<vector_size_t> maxOutputRowsSequence{1, 2, 5};
+  size_t sequenceIndex = 0;
+  while (auto output = sortBuffer.getOutput(
+             maxOutputRowsSequence
+                 [sequenceIndex++ % maxOutputRowsSequence.size()])) {
+    auto outputKeys = output->childAt(0)->asFlatVector<int64_t>();
+    auto outputPayloads = output->childAt(1)->asFlatVector<int64_t>();
+    for (auto row = 0; row < output->size(); ++row) {
+      keys.push_back(outputKeys->valueAt(row));
+      payloads.push_back(outputPayloads->valueAt(row));
+    }
+  }
+
+  ASSERT_EQ(keys, std::vector<int64_t>({0, 1, 2, 3, 4, 5, 6, 7}));
+  ASSERT_EQ(payloads, std::vector<int64_t>({0, 10, 20, 30, 40, 50, 60, 70}));
+  ASSERT_EQ(sortBuffer.numInputRows(), 8);
+  ASSERT_EQ(sortBuffer.numOutputRows(), 8);
+}
+
+TEST_F(SortBufferTest, parallelSortBufferParallelMergeDuplicateHeavy) {
+  ParallelSortBuffer sortBuffer(
+      ROW({"key", "payload"}, {BIGINT(), BIGINT()}),
+      {0},
+      {{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}},
+      pool_.get(),
+      2,
+      2,
+      executor_.get());
+
+  sortBuffer.addInput(makeRowVector(
+      {makeFlatVector<int64_t>({1, 1, 1}),
+       makeFlatVector<int64_t>({0, 1, 2})}));
+  sortBuffer.addInput(makeRowVector(
+      {makeFlatVector<int64_t>({1, 1}),
+       makeFlatVector<int64_t>({1'000, 1'001})}));
+  sortBuffer.addInput(makeRowVector(
+      {makeFlatVector<int64_t>({1, 1, 1, 1}),
+       makeFlatVector<int64_t>({2'000, 2'001, 2'002, 2'003})}));
+  sortBuffer.noMoreInput();
+
+  std::vector<int64_t> keys;
+  std::vector<int64_t> payloads;
+  while (auto output = sortBuffer.getOutput(1)) {
+    auto outputKeys = output->childAt(0)->asFlatVector<int64_t>();
+    auto outputPayloads = output->childAt(1)->asFlatVector<int64_t>();
+    for (auto row = 0; row < output->size(); ++row) {
+      keys.push_back(outputKeys->valueAt(row));
+      payloads.push_back(outputPayloads->valueAt(row));
+    }
+  }
+
+  ASSERT_EQ(keys, std::vector<int64_t>({1, 1, 1, 1, 1, 1, 1, 1, 1}));
+  ASSERT_EQ(
+      payloads,
+      std::vector<int64_t>(
+          {0, 1, 2, 1'000, 1'001, 2'000, 2'001, 2'002, 2'003}));
+  ASSERT_EQ(sortBuffer.numInputRows(), 9);
+  ASSERT_EQ(sortBuffer.numOutputRows(), 9);
 }
 
 TEST_F(SortBufferTest, multipleKeys) {

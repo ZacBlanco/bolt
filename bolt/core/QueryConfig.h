@@ -304,6 +304,36 @@ class QueryConfig {
   static constexpr const char* kOrderBySpillMemoryThreshold =
       "order_by_spill_memory_threshold";
 
+  /// Enables the staged parallel SortBuffer implementation for ORDER BY,
+  /// including one-pass sorted-run merge.
+  /// Defaults to false while the implementation is rolled out.
+  static constexpr const char* kOrderByParallelSortEnabled =
+      "order_by_parallel_sort_enabled";
+
+  /// The maximum number of threads to use for parallel ORDER BY merge. 0 uses
+  /// the implementation default.
+  static constexpr const char* kOrderByParallelMergeThreads =
+      "order_by_parallel_merge_threads";
+
+  /// Target number of output rows per parallel ORDER BY merge task. 0 computes
+  /// this automatically as roughly 90% of ORDER BY spill memory per merge
+  /// thread converted to rows using the estimated output row width.
+  static constexpr const char* kOrderByParallelMergeTargetRows =
+      "order_by_parallel_merge_target_rows";
+
+  /// Number of completed or running parallel ORDER BY merge tasks to keep ahead
+  /// of the next output task.
+  static constexpr const char* kOrderByParallelMergeLookaheadTasks =
+      "order_by_parallel_merge_lookahead_tasks";
+
+  /// Target number of rows per indexed sorted-spill block.
+  static constexpr const char* kOrderByIndexedSpillBlockRows =
+      "order_by_indexed_spill_block_rows";
+
+  /// Target number of bytes per indexed sorted-spill block.
+  static constexpr const char* kOrderByIndexedSpillBlockBytes =
+      "order_by_indexed_spill_block_bytes";
+
   /// The threshold for enabling LZ4 spill compression.
   static constexpr const char* kSpillLowCompressByteThreshold =
       "spill_low_compress_byte_threshold";
@@ -877,6 +907,35 @@ class QueryConfig {
   uint64_t orderBySpillMemoryThreshold() const {
     static constexpr uint64_t kDefault = 0;
     return get<uint64_t>(kOrderBySpillMemoryThreshold, kDefault);
+  }
+
+  bool orderByParallelSortEnabled() const {
+    return get<bool>(kOrderByParallelSortEnabled, false);
+  }
+
+  uint64_t orderByParallelMergeThreads() const {
+    static constexpr uint64_t kDefault = 0;
+    return get<uint64_t>(kOrderByParallelMergeThreads, kDefault);
+  }
+
+  uint64_t orderByParallelMergeTargetRows() const {
+    static constexpr uint64_t kDefault = 0;
+    return get<uint64_t>(kOrderByParallelMergeTargetRows, kDefault);
+  }
+
+  uint64_t orderByParallelMergeLookaheadTasks() const {
+    static constexpr uint64_t kDefault = 2;
+    return get<uint64_t>(kOrderByParallelMergeLookaheadTasks, kDefault);
+  }
+
+  uint64_t orderByIndexedSpillBlockRows() const {
+    static constexpr uint64_t kDefault = 4UL << 10;
+    return get<uint64_t>(kOrderByIndexedSpillBlockRows, kDefault);
+  }
+
+  uint64_t orderByIndexedSpillBlockBytes() const {
+    static constexpr uint64_t kDefault = 1UL << 20;
+    return get<uint64_t>(kOrderByIndexedSpillBlockBytes, kDefault);
   }
 
   uint64_t spillLowCompressByteThreshold() const {

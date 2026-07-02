@@ -206,6 +206,7 @@ std::string SpillConfig::toString() const {
       "testSpillPct:{},\n\t"
       "compressionKind:{},\n\t"
       "fileCreateConfig:{}\n"
+      "indexedSpillEnabled:{}\n"
       "rowBasedSpillMode:{}\n"
       "singlePartitionSerdeKind:{}\n"
       "jitEnabled:{}\n",
@@ -222,6 +223,7 @@ std::string SpillConfig::toString() const {
       testSpillPct,
       compressionKind,
       fileCreateConfig,
+      indexedSpillEnabled,
       rowBasedSpillMode,
       singlePartitionSerdeKind,
       jitEnabled);
@@ -246,6 +248,7 @@ folly::dynamic SpillConfig::serialize() const {
   obj["testSpillPct"] = testSpillPct;
   obj["compressionKind"] = static_cast<int>(compressionKind);
   obj["fileCreateConfig"] = fileCreateConfig;
+  obj["indexedSpillEnabled"] = indexedSpillEnabled;
   obj["rowBasedSpillMode"] = static_cast<int>(rowBasedSpillMode);
   obj["singlePartitionSerdeKind"] = singlePartitionSerdeKind;
   obj["spillPartitionsAdaptiveThreshold"] =
@@ -286,6 +289,8 @@ std::shared_ptr<SpillConfig> SpillConfig::deserialize(
   spillConfig->compressionKind =
       static_cast<common::CompressionKind>(obj["compressionKind"].asInt());
   spillConfig->fileCreateConfig = obj["fileCreateConfig"].asString();
+  spillConfig->indexedSpillEnabled =
+      obj.getDefault("indexedSpillEnabled", false).asBool();
   spillConfig->rowBasedSpillMode =
       static_cast<RowBasedSpillMode>(obj["rowBasedSpillMode"].asInt());
   spillConfig->singlePartitionSerdeKind =

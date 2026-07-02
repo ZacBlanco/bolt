@@ -68,6 +68,7 @@ bolt_add_library(
   MarkDistinct.cpp
   MemoryReclaimer.cpp
   MemoryPressureUtils.cpp
+  MergePath.cpp
   Merge.cpp
   MergeJoin.cpp
   MergeSource.cpp
@@ -79,6 +80,7 @@ bolt_add_library(
   OperatorTraceWriter.cpp
   OperatorUtils.cpp
   OrderBy.cpp
+  ParallelSortBuffer.cpp
   OutputBuffer.cpp
   OutputBufferManager.cpp
   PartitionedOutput.cpp
@@ -91,6 +93,7 @@ bolt_add_library(
   RowsStreamingWindowBuild.cpp
   RowsStreamingWindowPartition.cpp
   SortBuffer.cpp
+  SpilledSortedRun.cpp
   SortedAggregations.cpp
   SortWindowBuild.cpp
   Spill.cpp
@@ -176,6 +179,28 @@ elseif(${BOLT_BUILD_TEST_UTILS})
 endif()
 
 if(${BOLT_BUILD_BENCHMARKS})
+  add_executable(bolt_parallel_order_by_benchmark ParallelOrderByBenchmark.cpp)
+  target_link_libraries(
+    bolt_parallel_order_by_benchmark PRIVATE
+      bolt_exec
+      bolt_testutils
+      ${FOLLY_BENCHMARK}
+      GTest::gtest_main
+  )
+
+  if(${BOLT_ENABLE_PARQUET})
+    add_executable(bolt_parallel_order_by_benchmark_pb ParallelOrderByBenchmarkPB.cpp)
+    target_link_libraries(
+      bolt_parallel_order_by_benchmark_pb PRIVATE
+        bolt_exec
+        bolt_testutils
+        bolt_dwio_parquet_reader
+        bolt_dwio_parquet_writer
+        ${FOLLY_BENCHMARK}
+        GTest::gtest_main
+    )
+  endif()
+
   add_subdirectory(benchmarks)
 endif()
 

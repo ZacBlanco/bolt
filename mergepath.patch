@@ -1,0 +1,4039 @@
+diff --git a/bolt/core/QueryConfig.h b/bolt/core/QueryConfig.h
+index f168608283..6c84690953 100644
+--- a/bolt/core/QueryConfig.h
++++ b/bolt/core/QueryConfig.h
+@@ -304,6 +304,18 @@ class QueryConfig {
+   static constexpr const char* kOrderBySpillMemoryThreshold =
+       "order_by_spill_memory_threshold";
+ 
++  /// The maximum number of threads to use for the merge path. 0 uses hardware
++  /// parallelism. This parameter only takes effect when the task the OrderBy
++  /// operator resides in is using single-threaded mode (i.e. when using Spark)
++  /// or if the executor within the task is not available.
++  static constexpr const char* kOrderByMergePathParallelism =
++      "order_by_merge_path_parallelism";
++
++  /// Whether or not to enable the Merge Path implementation of the OrderBy
++  /// operator.
++  static constexpr const char* kOrderByMergePathEnabled =
++      "order_by_merge_path_enabled";
++
+   /// The threshold for enabling LZ4 spill compression.
+   static constexpr const char* kSpillLowCompressByteThreshold =
+       "spill_low_compress_byte_threshold";
+@@ -879,6 +891,16 @@ class QueryConfig {
+     return get<uint64_t>(kOrderBySpillMemoryThreshold, kDefault);
+   }
+ 
++  uint64_t orderByMergePathParallelism() const {
++    static constexpr uint64_t kDefault = 0;
++    return get<uint64_t>(kOrderByMergePathParallelism, kDefault);
++  }
++
++  uint64_t orderByMergePathEnabled() const {
++    static constexpr uint64_t kDefault = false;
++    return get<bool>(kOrderByMergePathEnabled, kDefault);
++  }
++
+   uint64_t spillLowCompressByteThreshold() const {
+     static constexpr uint64_t kDefault = 4UL << 30;
+     return get<uint64_t>(kSpillLowCompressByteThreshold, kDefault);
+diff --git a/bolt/exec/CMakeLists.txt b/bolt/exec/CMakeLists.txt
+index 7f1a6421da..b74ebcc08d 100644
+--- a/bolt/exec/CMakeLists.txt
++++ b/bolt/exec/CMakeLists.txt
+@@ -60,6 +60,7 @@ bolt_add_library(
+   HashProbe.cpp
+   HashTable.cpp
+   IndexLookupJoin.cpp
++  ISortBuffer.cpp
+   JoinBridge.cpp
+   Limit.cpp
+   LocalPartition.cpp
+@@ -79,6 +80,7 @@ bolt_add_library(
+   OperatorTraceWriter.cpp
+   OperatorUtils.cpp
+   OrderBy.cpp
++  OrderByRowContainer.cpp
+   OutputBuffer.cpp
+   OutputBufferManager.cpp
+   PartitionedOutput.cpp
+@@ -91,6 +93,7 @@ bolt_add_library(
+   RowsStreamingWindowBuild.cpp
+   RowsStreamingWindowPartition.cpp
+   SortBuffer.cpp
++  SortBufferMergePath.cpp
+   SortedAggregations.cpp
+   SortWindowBuild.cpp
+   Spill.cpp
+diff --git a/bolt/exec/ISortBuffer.cpp b/bolt/exec/ISortBuffer.cpp
+new file mode 100644
+index 0000000000..6fc4e030d5
+--- /dev/null
++++ b/bolt/exec/ISortBuffer.cpp
+@@ -0,0 +1,125 @@
++/*
++ * Copyright (c) Facebook, Inc. and its affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "bolt/exec/ISortBuffer.h"
++#include "bolt/exec/MemoryReclaimer.h"
++#include "bolt/exec/Spill.h"
++
++namespace bytedance::bolt::exec {
++
++void ISortBuffer::reserveSpace(
++    const VectorPtr& input,
++    const RowContainer* container,
++    const common::SpillConfig* spillConfig,
++    memory::MemoryPool* const pool,
++    tsan_atomic<bool>* const nonReclaimableSection) {
++  if (spillConfig == nullptr) {
++    return;
++  }
++  auto currentMemoryUsage = pool->currentBytes();
++  auto [freeRows, outOfLineFreeBytes] = container->freeSpace();
++  const auto outOfLineBytes =
++      container->stringAllocator().retainedSize() - outOfLineFreeBytes;
++  const int64_t flatInputBytes = input->usedSize();
++  const auto minReservationBytes =
++      currentMemoryUsage * spillConfig->minSpillableReservationPct / 100;
++  const auto availableReservationBytes = pool->availableReservation();
++  const int64_t estimatedIncrementalBytes = container->sizeIncrement(
++      input->size(), outOfLineBytes ? flatInputBytes : 0);
++  bool needReserve = true;
++  if (availableReservationBytes > minReservationBytes) {
++    // If we have enough free rows for input rows and enough variable length
++    // free space for the vector's flat size, no need for spilling.
++    if (std::cmp_greater(freeRows, input->size()) &&
++        (outOfLineBytes == 0 || outOfLineFreeBytes >= flatInputBytes)) {
++      needReserve = false;
++    }
++
++    // If the current available reservation in memory pool is 2X the
++    // estimatedIncrementalBytes, no need to spill.
++    if (availableReservationBytes > 2 * estimatedIncrementalBytes) {
++      needReserve = false;
++    }
++  }
++
++  if (!needReserve) {
++    return;
++  }
++  // Try reserving targetIncrementBytes more in memory pool, if succeed, no
++  // need to spill.
++  const auto targetIncrementBytes = std::max<int64_t>(
++      estimatedIncrementalBytes * 2,
++      currentMemoryUsage * spillConfig->spillableReservationGrowthPct / 100);
++  {
++    ReclaimableSectionGuard guard(nonReclaimableSection);
++    if (pool->maybeReserve(targetIncrementBytes)) {
++      return;
++    }
++  }
++  LOG(WARNING) << "Failed to reserve " << succinctBytes(targetIncrementBytes)
++               << " for memory pool " << pool->name()
++               << ", usage: " << succinctBytes(pool->currentBytes())
++               << ", reservation: " << succinctBytes(pool->reservedBytes());
++}
++
++bool ISortBuffer::willInputFit(
++    uint64_t numRows,
++    uint64_t spillMemoryThreshold,
++    memory::MemoryPool* const pool,
++    const common::SpillConfig* spillConfig) {
++  if (spillConfig == nullptr) {
++    return true;
++  }
++
++  if (numRows == 0) {
++    return true;
++  }
++
++  // Test-only spill path.
++  if (numRows > 0 && testingTriggerSpill()) {
++    return false;
++  }
++
++  // If current memory usage exceeds spilling threshold, trigger spilling.
++  const auto currentMemoryUsage = pool->currentBytes();
++  if (spillMemoryThreshold != 0 && currentMemoryUsage > spillMemoryThreshold) {
++    return false;
++  }
++
++  return true;
++}
++
++void ISortBuffer::computeJitCmpFunction(
++    RowContainer* data,
++    exec::OperatorCtx* operatorCtx,
++    const std::vector<CompareFlags>& sortCompareFlags) {
++#ifdef ENABLE_BOLT_JIT
++  if (cmp_ == nullptr && operatorCtx &&
++      operatorCtx->driverCtx()->queryConfig().enableJitRowCmpRow()) {
++    if (RowContainer::JITable(data->keyTypes())) {
++      auto [jitMod, rowRowCmpfn] = data->codegenCompare(
++          data->keyTypes(),
++          sortCompareFlags,
++          bolt::jit::CmpType::SORT_LESS,
++          true);
++      jitModule_ = std::move(jitMod);
++      cmp_ = (RowRowCompare)jitModule_->getFuncPtr(rowRowCmpfn);
++    }
++  }
++#endif
++}
++
++} // namespace bytedance::bolt::exec
+diff --git a/bolt/exec/ISortBuffer.h b/bolt/exec/ISortBuffer.h
+new file mode 100644
+index 0000000000..b368d7f7fa
+--- /dev/null
++++ b/bolt/exec/ISortBuffer.h
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (c) Facebook, Inc. and its affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <exec/Operator.h>
++#include "RowContainer.h"
++#include "common/base/SortStat.h"
++#include "common/base/SpillStats.h"
++#include "vector/ComplexVector.h"
++
++namespace bytedance::bolt::exec {
++
++class ISortBuffer {
++ public:
++  virtual void addInput(const VectorPtr& input) = 0;
++  virtual void noMoreInput() = 0;
++  virtual bytedance::bolt::RowVectorPtr getOutput(uint32_t maxOutputRows) = 0;
++  virtual void reclaim(uint64_t targetBytes) = 0;
++  // numInput rows, numOutputRows, estimateOutputRowSize
++  virtual std::optional<uint64_t> estimateOutputRowSize() const = 0;
++  virtual size_t numInputRows() = 0;
++  virtual size_t numOutputRows() = 0;
++  virtual std::optional<common::SpillStats> spilledStats() const = 0;
++  virtual std::optional<common::SpillReadStats> spillReadStats() const = 0;
++  virtual std::optional<common::SortStats> sortStats() const = 0;
++  virtual ~ISortBuffer() = default;
++  // Reserves space in the memory pool for the input vector.
++  static void reserveSpace(
++      const VectorPtr& input,
++      const RowContainer* container,
++      const common::SpillConfig* spillConfig,
++      memory::MemoryPool* pool,
++      tsan_atomic<bool>* nonReclaimableSection);
++  static bool willInputFit(
++      uint64_t numRows,
++      uint64_t spillMemoryThreshold,
++      memory::MemoryPool* pool,
++      const common::SpillConfig* spillConfig);
++
++ protected:
++  void computeJitCmpFunction(
++      RowContainer* data,
++      exec::OperatorCtx* operatorCtx,
++      const std::vector<CompareFlags>& sortCompareFlags);
++  RowRowCompare cmp_{nullptr};
++#ifdef ENABLE_BOLT_JIT
++  bolt::jit::CompiledModuleSP jitModule_;
++#endif
++};
++
++} // namespace bytedance::bolt::exec
+diff --git a/bolt/exec/OrderByRowContainer.cpp b/bolt/exec/OrderByRowContainer.cpp
+new file mode 100644
+index 0000000000..18107275fd
+--- /dev/null
++++ b/bolt/exec/OrderByRowContainer.cpp
+@@ -0,0 +1,552 @@
++
++#include <algorithm>
++#include <fstream>
++#include <memory>
++#include <optional>
++
++#include "bolt/common/file/File.h"
++#include "bolt/common/file/FileInputStream.h"
++#include "bolt/common/memory/ByteStream.h"
++#include "bolt/common/memory/MemoryPool.h"
++#include "bolt/exec/OrderByRowContainer.h"
++#include "bolt/serializers/UnsafeRowSerializer.h"
++#include "bolt/vector/VectorStream.h"
++
++namespace bytedance::bolt::exec {
++using bytedance::bolt::memory::MemoryPool;
++
++std::tuple<std::unique_ptr<std::ofstream>, std::unique_ptr<OutputStream>>
++SpilledBlockFile::createOutputStream() {
++  auto outfile = std::make_unique<std::ofstream>(filePath_);
++  auto outputStream = std::make_unique<OStreamOutputStream>(outfile.get());
++  return std::make_tuple(std::move(outfile), std::move(outputStream));
++}
++
++std::unique_ptr<ByteInputStream> SpilledBlockFile::createInputStream() {
++  auto readFile = std::make_unique<LocalReadFile>(filePath_);
++  constexpr uint64_t kBufferSize = 64 * 1024 * 1024; // 64 MiB
++  auto stream = std::make_unique<bytedance::bolt::common::FileInputStream>(
++      std::move(readFile), kBufferSize, pool_);
++  return stream;
++}
++
++PinnedRowContainer::PinnedRowContainer(
++    std::shared_ptr<LoadedRowContainer> rows,
++    RowContainerRef* parent)
++    : rows_(std::move(rows)), parent_(parent) {}
++
++PinnedRowContainer::~PinnedRowContainer() {
++  if (auto* parentRef = parent_.value()) {
++    // must lock parent since we may modify the in memory/LRU state
++    std::lock_guard guard(parentRef->lock_);
++    auto pinCount = parentRef->pinCount_.fetch_sub(1);
++    // if the pin count is 0, then we can add the container back to the LRU
++    // list for potential eviction.
++    if (pinCount == 1) {
++      if (auto* parentContainer = parentRef->parent_.value()) {
++        parentContainer->addToLRU(parentRef->id_);
++      }
++    }
++  }
++}
++
++static uint64_t rowContainerMemoryUsage(
++    const RowContainer* container,
++    const std::vector<char*>& rows) {
++  return container->estimateRowSize().value_or(0) * rows.size();
++}
++
++SpillableRowContainer::~SpillableRowContainer() {
++  if (auto* parentRef = container_->parent_.value()) {
++    parentRef->releaseContainer(container_);
++  }
++}
++
++std::shared_ptr<PinnedRowContainer> SpillableRowContainer::pin() {
++  return container_->pin();
++}
++
++uint64_t SpillableRowContainer::numRows() {
++  return container_->numRows();
++}
++
++// returns - (sortedColumnTypes, nonSortedColumnTypes, sortedSpillRowType,
++// projectionMapping)
++//
++// sortedColumnTypes - The types of the columns that are sorted (in order)
++// nonSortedColumnTypes - The types of the columns that are not sorted (in
++//                        order).
++// sortedSpillRowType - The row type of the spilled rows.
++// projectionMapping - The mapping of the columns in the spilled rows to the
++// columns in the input row.
++//                     The index in this vector represents the column index in
++//                     the spilled row. The value in this vector represents the
++//                     column index in the input row. e.g. projectionMapping[0]
++//                     represents the column in the spilled row at index 0 is
++//                     the column in the input row at index
++//                     projectionMapping[0].
++std::tuple<
++    std::vector<TypePtr>,
++    std::vector<TypePtr>,
++    RowTypePtr,
++    std::vector<size_t>>
++calculateTypes(
++    const std::vector<column_index_t>& sortColumnIndices,
++    const std::vector<CompareFlags>& sortCompareFlags,
++    const RowTypePtr& inputType) {
++  std::vector<TypePtr> sortedColumnTypes;
++  std::vector<TypePtr> nonSortedColumnTypes;
++  std::vector<std::string> sortedSpillColumnNames;
++  std::vector<TypePtr> sortedSpillColumnTypes;
++  std::vector<size_t> projectionMapping;
++  sortedColumnTypes.reserve(sortColumnIndices.size());
++  nonSortedColumnTypes.reserve(inputType->size() - sortColumnIndices.size());
++  sortedSpillColumnNames.reserve(inputType->size());
++  sortedSpillColumnTypes.reserve(inputType->size());
++  std::unordered_set<column_index_t> sortedChannelSet;
++  // Sorted key columns.
++  for (column_index_t i = 0; i < sortColumnIndices.size(); ++i) {
++    projectionMapping.push_back(sortColumnIndices.at(i));
++    sortedColumnTypes.emplace_back(inputType->childAt(sortColumnIndices.at(i)));
++    sortedSpillColumnTypes.emplace_back(
++        inputType->childAt(sortColumnIndices.at(i)));
++    sortedSpillColumnNames.emplace_back(
++        inputType->nameOf(sortColumnIndices.at(i)));
++    sortedChannelSet.emplace(sortColumnIndices.at(i));
++  }
++  // Non-sorted key columns.
++  for (column_index_t i = 0, nonSortedIndex = sortCompareFlags.size();
++       i < inputType->size();
++       ++i) {
++    if (sortedChannelSet.count(i) != 0) {
++      continue;
++    }
++    projectionMapping.push_back(i);
++    nonSortedColumnTypes.emplace_back(inputType->childAt(i));
++    sortedSpillColumnTypes.emplace_back(inputType->childAt(i));
++    sortedSpillColumnNames.emplace_back(inputType->nameOf(i));
++  }
++  return std::make_tuple(
++      sortedColumnTypes,
++      nonSortedColumnTypes,
++      std::make_shared<RowType>(
++          std::move(sortedSpillColumnNames), std::move(sortedSpillColumnTypes)),
++      projectionMapping);
++}
++
++std::vector<char*> getAllRows(RowContainer* container) {
++  int64_t totalRows = container->numRows();
++  std::vector<char*> allRows(totalRows);
++  RowContainerIterator iter;
++  iter.reset();
++  int32_t rowsRetrieved = container->listRows(&iter, totalRows, allRows.data());
++  allRows.resize(rowsRetrieved);
++
++  return allRows;
++}
++
++OrderByRowContainer::OrderByRowContainer(
++    const std::vector<column_index_t>& sortColumnIndices,
++    const std::vector<CompareFlags>& sortCompareFlags,
++    const RowTypePtr& inputType,
++    MemoryPool* pool,
++    const common::SpillConfig* spillConfig,
++    uint64_t maxMemory)
++    : pool_(pool),
++      maxMemory_(0), // TODO change this to actual maxMemory when
++                     // SortBufferMergePath supports spilling
++      inputType_(inputType),
++      spillConfig_(spillConfig),
++      evictions_(0) {
++  auto
++      [sortedColumnTypes,
++       nonSortedColumnTypes,
++       sortedSpillRowType,
++       projectionMapping] =
++          calculateTypes(sortColumnIndices, sortCompareFlags, inputType);
++  sortedColumnTypes_ = sortedColumnTypes;
++  nonSortedColumnTypes_ = nonSortedColumnTypes;
++  spillType_ = sortedSpillRowType;
++  projectionMapping_ = projectionMapping;
++  spillPath_ =
++      spillConfig_ == nullptr ? "/tmp" : spillConfig_->getSpillDirPathCb();
++  rowContainer_ = emptyRowContainer();
++}
++
++std::vector<char*> OrderByRowContainer::addVectorToContainer(
++    const VectorPtr& input,
++    RowContainer* container,
++    std::mutex& rowContainerLock,
++    const std::vector<size_t>& projectionMapping) {
++  std::vector<char*> rows(input->size());
++  SelectivityVector allRows(input->size());
++  std::lock_guard containerLock(rowContainerLock);
++  for (int row = 0; row < input->size(); ++row) {
++    rows[row] = container->newRow();
++  }
++  auto* inputRow = input->as<RowVector>();
++  for (int i = 0; i < projectionMapping.size(); ++i) {
++    auto outputChannel = i;
++    auto inputChannel = projectionMapping[i];
++    DecodedVector decoded(*inputRow->childAt(inputChannel), allRows);
++    auto kind = inputRow->childAt(inputChannel)->type()->kind();
++    BOLT_DYNAMIC_TYPE_DISPATCH(
++        container->storeColumn,
++        kind,
++        decoded,
++        input->size(),
++        rows,
++        static_cast<size_t>(outputChannel));
++  }
++  return rows;
++}
++std::shared_ptr<SpillableRowContainer> OrderByRowContainer::addVector(
++    const VectorPtr& input) {
++  std::vector<char*> rows;
++  rows = OrderByRowContainer::addVectorToContainer(
++      input, rowContainer_.get(), rowContainerLock_, projectionMapping_);
++  return this->addToRowContainer(std::move(rows));
++}
++
++std::shared_ptr<SpillableRowContainer> OrderByRowContainer::addVectors(
++    const std::vector<VectorPtr>& vectors) {
++  auto totalRows = 0;
++  std::vector<std::vector<char*>> rows(vectors.size());
++  for (auto& vector : vectors) {
++    totalRows += vector->size();
++    rows.push_back(addVectorToContainer(
++        vector, rowContainer_.get(), rowContainerLock_, projectionMapping_));
++  }
++  std::vector<char*> allRows;
++  allRows.reserve(totalRows);
++  for (auto& row : rows) {
++    allRows.insert(allRows.end(), row.begin(), row.end());
++  }
++  return this->addToRowContainer(std::move(allRows));
++}
++
++OrderByRowContainer::~OrderByRowContainer() {
++  for (auto& [id, ref] : containers_) {
++    if (ref != nullptr) {
++      ref->parent_ = {};
++    }
++  }
++}
++
++std::string OrderByRowContainer::dumpLru() {
++  std::stringstream ss;
++  ss << "HEAD -> ";
++  auto container = head_.lock();
++  while (container) {
++    ss << container->id_ << " ";
++    container = container->lruNext_.lock();
++  }
++  ss << " <- TAIL";
++  return ss.str();
++}
++
++std::shared_ptr<SpillableRowContainer> OrderByRowContainer::addToRowContainer(
++    std::vector<char*>&& allRows) {
++  uint32_t id = idCounter_.fetch_add(1);
++  auto container = std::make_shared<RowContainerRef>(id, allRows.size(), this);
++  uint64_t memoryUsage = rowContainerMemoryUsage(rowContainer_.get(), allRows);
++  container->rows_ = std::make_unique<LoadedRowContainer>(
++      rowContainer_.get(), std::move(allRows));
++  {
++    std::lock_guard lock(lock_);
++    containers_.emplace(container->id_, container);
++    memoryCounter_.fetch_add(memoryUsage);
++    addToLRU(container->id_);
++  }
++  checkMemoryUsage();
++  return std::make_shared<SpillableRowContainer>(container);
++}
++
++std::unique_ptr<RowContainer> OrderByRowContainer::emptyRowContainer() {
++  return std::make_unique<RowContainer>(
++      sortedColumnTypes_, nonSortedColumnTypes_, pool_);
++}
++
++// Removes a container from tracking. Removes from the LRU list. de-allocates
++// any in-memory row container decrements memory counter.
++void OrderByRowContainer::releaseContainer(
++    const std::shared_ptr<RowContainerRef>& container) {
++  std::lock_guard lock(lock_);
++
++  auto it = containers_.find(container->id_);
++  if (it != containers_.end()) {
++    auto rowContainer = it->second;
++    removeFromLRU(container->id_);
++    if (container->rows_.has_value()) {
++      memoryCounter_.fetch_sub(rowContainerMemoryUsage(
++          container->rows_.value()->container_,
++          container->rows_.value()->rows_));
++    }
++    container->rows_.reset();
++    containers_.erase(it);
++  }
++}
++
++// requires that the reclaimLock_ already be held. Decrements the memory counter
++// by the size of all containers removed.
++// It is important that the locking order is respected. To prevent deadlock the
++// lock_ can only be acquired after a RowContainerRef's lock is acquired.
++uint64_t OrderByRowContainer::reclaimMemory(uint64_t requiredBytes) {
++  uint64_t reclaimed = 0;
++  auto current = tail_;
++  while (reclaimed < requiredBytes) {
++    if (auto ptr = current.lock()) {
++      std::lock_guard containerLock(ptr->lock_);
++      std::lock_guard lock(lock_);
++      if (ptr->pinCount_.load() > 0) {
++        // check if while locking this container was pinned
++        // In this case, the container was likely pinned while
++        // trying to acquire the lock. Use the new tail pointer
++        // to try the next container.
++        current = tail_;
++        continue;
++      }
++
++      removeFromLRU(ptr->id_);
++      evictions_++;
++      if (ptr->rows_.has_value()) {
++        auto reclaimedMem = rowContainerMemoryUsage(
++            ptr->rows_.value()->container_, ptr->rows_.value()->rows_);
++        ptr->spillToDisk();
++        ptr->rows_.reset();
++        memoryCounter_.fetch_sub(reclaimedMem);
++        reclaimed += reclaimedMem;
++      }
++      current = tail_;
++      if (current.expired()) {
++        break;
++      }
++    } else {
++      break;
++    }
++  }
++
++  return reclaimed;
++}
++
++// Adds to the head_ of the list.
++void OrderByRowContainer::addToLRU(uint64_t id) {
++  std::lock_guard lock(lock_);
++  auto it = containers_.find(id);
++  if (it == containers_.end()) {
++    return;
++  }
++  const std::shared_ptr<RowContainerRef>& container = it->second;
++  // if we're adding to the LRU list, ensure that both existing pointers are
++  // null
++  BOLT_CHECK(
++      container->lruPrev_.expired(),
++      "container {} already in LRU. prev: {}, next {}",
++      id,
++      container->lruPrev_.use_count(),
++      container->lruNext_.use_count());
++  BOLT_CHECK(
++      container->lruNext_.expired(),
++      "container {} already in LRU. prev: {}, next {}",
++      id,
++      container->lruPrev_.use_count(),
++      container->lruNext_.use_count());
++  if (head_.expired()) {
++    BOLT_CHECK(container->lruPrev_.expired()); // should not occur
++    head_ = tail_ = container;
++    container->lruPrev_.reset();
++    container->lruNext_.reset();
++  } else {
++    // adding to the head of the list, set the current value as the head.
++    container->lruNext_ = head_;
++    if (auto head = head_.lock()) {
++      head->lruPrev_ = container;
++    }
++    head_ = container;
++  }
++}
++
++void OrderByRowContainer::removeFromLRU(uint64_t id) {
++  std::lock_guard lock(lock_);
++  auto it = containers_.find(id);
++  if (it == containers_.end()) {
++    return;
++  }
++  const std::shared_ptr<RowContainerRef>& container = it->second;
++  if (container == nullptr) {
++    return;
++  }
++  if (auto head = head_.lock()) {
++    if (container == head) {
++      head_ = container->lruNext_;
++    }
++  }
++  if (auto tail = tail_.lock()) {
++    if (container == tail) {
++      tail_ = container->lruPrev_;
++    }
++  }
++
++  if (auto prev = container->lruPrev_.lock()) {
++    prev->lruNext_ = container->lruNext_;
++  }
++  if (auto next = container->lruNext_.lock()) {
++    next->lruPrev_ = container->lruPrev_;
++  }
++
++  container->lruPrev_.reset();
++  container->lruNext_.reset();
++}
++
++void OrderByRowContainer::checkMemoryUsage() {
++  if (maxMemory_ == 0) {
++    return;
++  }
++  BOLT_FAIL("Should not be reclaiming memory: maxMemory = {}", maxMemory_);
++  std::lock_guard lock(reclaimLock_);
++  uint64_t usedMemory = rowContainer_->usedBytes();
++  if (usedMemory > maxMemory_) {
++    reclaimMemory(usedMemory - maxMemory_);
++  }
++}
++
++std::unique_ptr<RowContainer> OrderByRowContainer::release() {
++  std::lock_guard guard(lock_);
++  containers_.clear();
++  std::unique_ptr<RowContainer> rowContainer = std::move(rowContainer_);
++  return rowContainer;
++}
++
++RowContainerRef::RowContainerRef(
++    uint32_t id,
++    uint64_t numRows,
++    OrderByRowContainer* parent)
++    : id_(id), numRows_(numRows), parent_(parent) {
++  spillMemoryPool_ = parent->pool_;
++  spillRowType_ = parent->spillType_;
++}
++
++RowContainerRef::~RowContainerRef() {
++  // remove from LRU to prevent dangling pointers in the LRU list
++  if (auto parent = parent_.value()) {
++    parent->removeFromLRU(id_);
++  }
++}
++
++std::shared_ptr<PinnedRowContainer> RowContainerRef::pin() {
++  {
++    std::lock_guard lock(lock_);
++    auto previousPinCount = pinCount_.fetch_add(1);
++    // if the previous count was 0, then we need to load the rows and remove
++    // from the LRU list.
++    if (previousPinCount == 0) {
++      // first, remove from LRU list and load rows if necessary.
++      if (auto* parent = parent_.value()) {
++        parent->removeFromLRU(id_);
++      }
++      // load rows if required. Make sure afterward we are still below the
++      // memory threshold.
++      if (!rows_.has_value()) {
++        loadFromDisk();
++      }
++    }
++  }
++  if (auto* parent = parent_.value()) {
++    parent->checkMemoryUsage();
++  }
++  auto pinned = std::make_shared<PinnedRowContainer>(rows_.value(), this);
++  // existingPin_ = pinned;
++  return pinned;
++}
++
++std::string RowContainerRef::filePath() const {
++  if (auto* parent = parent_.value()) {
++    return parent->spillPath_ + "/" + std::to_string(id_);
++  }
++  return "/tmp/orderby_spill_" + std::to_string(id_);
++}
++
++void RowContainerRef::spillToDisk() {
++  BOLT_FAIL("Spilling is not supported");
++  if (!rows_.has_value()) {
++    return; // no data to spill
++  }
++  std::lock_guard lock(lock_);
++
++  // if the current container is dirty, or we have not spilled yet, perform the
++  // spill. Otherwise we can just clear the memory
++  if (!spillFile_.has_value()) {
++    auto rowContainer = rows_.value();
++    auto& allRows = rowContainer->rows_;
++    // Filter out rows which have been nulled.
++    auto new_end =
++        std::remove_if(allRows.begin(), allRows.end(), [](const char* n) {
++          return n == nullptr;
++        });
++    allRows.erase(new_end, allRows.end());
++    auto serialized = BaseVector::create<FlatVector<StringView>>(
++        VARBINARY(), allRows.size(), spillMemoryPool_);
++    rowContainer->container_->extractSerializedRows(
++        folly::Range<char**>(allRows.data(), allRows.size()), serialized);
++    auto serde = serializer::spark::UnsafeRowVectorSerde();
++    auto serializer = serde.createBatchSerializer(spillMemoryPool_);
++    spillFile_ = SpilledBlockFile(filePath(), spillMemoryPool_);
++    auto [outfile, outputStream] = spillFile_.value().createOutputStream();
++    auto rowVector = std::shared_ptr<RowVector>(new RowVector(
++        spillMemoryPool_,
++        ROW({"data"}, {VARBINARY()}),
++        BufferPtr(nullptr),
++        serialized->size(),
++        {serialized}));
++    serializer->serialize(rowVector, outputStream.get());
++    rowContainer->container_->eraseRows(
++        folly::Range(allRows.data(), allRows.data() + allRows.size()));
++  }
++
++  // Clear the in-memory data
++  rows_.reset();
++}
++
++// Load a block from disk. rows_ is guaranteed to be populated after this method
++// is called. It is not added to the parent LRU list yet though.
++void RowContainerRef::loadFromDisk() {
++  BOLT_FAIL("spilling is not supported");
++  std::lock_guard lock(lock_);
++
++  if (!spillFile_.has_value() || rows_.has_value()) {
++    if (!rows_.has_value()) {
++      // rows_ must be populated after this call, but there is no spill file on
++      // disk. In this case, it's likely that the container was never written to
++      // before. Just create a new empty one.
++      if (auto refParent = parent_.value()) {
++        std::vector<char*> tmpRows(0);
++        rows_ = std::make_shared<LoadedRowContainer>(
++            refParent->rowContainer_.get(), std::move(tmpRows));
++      }
++    }
++    return;
++  }
++
++  // Read from spilled file, deserialize rows
++  auto inputStream = spillFile_.value().createInputStream();
++  auto serde = serializer::spark::UnsafeRowVectorSerde();
++  RowTypePtr type = ROW({"data"}, {VARBINARY()});
++  RowVectorPtr result = RowVector::createEmpty(type, spillMemoryPool_);
++  serde.deserialize(
++      inputStream.get(), spillMemoryPool_, type, &result, nullptr);
++  BOLT_CHECK(parent_.has_value(), "parent_ must be non-null");
++
++  auto* serializedRows = result->childAt(0)->asFlatVector<StringView>();
++  std::vector<char*> rows(result->size());
++  auto& rowContainer = parent_.value()->rowContainer_;
++  for (auto i = 0; i < result->size(); ++i) {
++    char* row = rows[i] = rowContainer->newRow();
++    rowContainer->storeSerializedRow(*serializedRows, i, row);
++  }
++  rows_ =
++      std::make_shared<LoadedRowContainer>(rowContainer.get(), std::move(rows));
++  parent_.value()->memoryCounter_.fetch_add(
++      rowContainerMemoryUsage(rows_.value()->container_, rows_.value()->rows_));
++}
++
++} // namespace bytedance::bolt::exec
+diff --git a/bolt/exec/OrderByRowContainer.h b/bolt/exec/OrderByRowContainer.h
+new file mode 100644
+index 0000000000..596080bf64
+--- /dev/null
++++ b/bolt/exec/OrderByRowContainer.h
+@@ -0,0 +1,303 @@
++/*
++ * Copyright (c) Facebook, Inc. and its affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#pragma once
++
++#include <utility>
++
++#include "bolt/common/file/File.h"
++#include "bolt/common/memory/Memory.h"
++#include "bolt/exec/RowContainer.h"
++
++namespace bytedance::bolt::exec {
++using bytedance::bolt::memory::MemoryPool;
++
++// default target memory utilization of a SpillableRowContainer.
++constexpr uint32_t kDefaultContainerSize = 256 * 1024 * 1024;
++
++class RowContainerRef;
++class OrderByRowContainer;
++
++struct LoadedRowContainer {
++  RowContainer* container_;
++  std::vector<char*> rows_;
++  LoadedRowContainer(RowContainer* container, std::vector<char*>&& rows)
++      : container_(container), rows_(std::move(rows)) {}
++};
++
++class PinnedRowContainer {
++ public:
++  PinnedRowContainer(
++      std::shared_ptr<LoadedRowContainer> rows,
++      RowContainerRef* container);
++  RowContainer* getRowContainer() {
++    return rows_->container_;
++  }
++
++  std::vector<char*>& getRows() {
++    return rows_->rows_;
++  }
++
++  std::vector<char*> exportRows() {
++    return std::move(rows_->rows_);
++  }
++
++  ~PinnedRowContainer();
++
++ private:
++  std::shared_ptr<LoadedRowContainer> rows_;
++  std::optional<RowContainerRef*> parent_;
++};
++
++class SpilledBlockFile {
++ public:
++  SpilledBlockFile(std::string filePath, MemoryPool* memoryPool)
++      : filePath_(std::move(filePath)), pool_(memoryPool) {
++    // create empty file
++    FILE* f = fopen(filePath_.c_str(), "w");
++    // bolt throw
++    BOLT_CHECK(f != nullptr, "Failed to create file: {}", filePath_);
++    fclose(f);
++  }
++  ~SpilledBlockFile() {
++    unlink(filePath_.c_str());
++  }
++  std::string getFilePath() {
++    return filePath_;
++  }
++
++  std::tuple<std::unique_ptr<std::ofstream>, std::unique_ptr<OutputStream>>
++  createOutputStream();
++  std::unique_ptr<ByteInputStream> createInputStream();
++
++ private:
++  std::string filePath_;
++  MemoryPool* pool_;
++};
++
++class SpillableRowContainer {
++ public:
++  explicit SpillableRowContainer(
++      const std::shared_ptr<RowContainerRef>& container)
++      : container_(container) {}
++  ~SpillableRowContainer();
++
++  // Get access to the in-memory RowContainer. May cause a read from disk.
++  std::shared_ptr<PinnedRowContainer> pin();
++  uint64_t numRows();
++
++ private:
++  std::shared_ptr<RowContainerRef> container_;
++};
++
++// A spillable RowContainer is a RowContainer which may either be in-memory or
++// on disk at any point. To access the underlying vector, use the `pin()` method
++// to prevent the vector from being spilled to disk. Pinning may force a read
++// from disk.
++class RowContainerRef {
++  friend class OrderByRowContainer;
++  friend class PinnedRowContainer;
++  friend class SpillableRowContainer;
++
++ public:
++  RowContainerRef(uint32_t id, uint64_t numRows, OrderByRowContainer* parent);
++  ~RowContainerRef();
++
++  // Pinning this container will remove it from the LRU list in
++  // OrderByRowContainer and return a PinnedRowContainer. When the final
++  // PinnedRowContainer is destroyed, the container will be returned to the
++  // front of the LRU list.
++  std::shared_ptr<PinnedRowContainer> pin();
++  uint64_t numRows() const {
++    return numRows_;
++  }
++
++ private:
++  std::string filePath() const;
++  void spillToDisk();
++  void loadFromDisk();
++  uint32_t id_;
++  uint64_t numRows_;
++  std::optional<OrderByRowContainer*> parent_;
++
++  // Any time we load from disk, create a reference to the row container. When
++  // the container is flushed to disk, this will be empty.
++  std::optional<std::shared_ptr<LoadedRowContainer>> rows_;
++
++  // We should only create one instance of the PinnedRowContainer for each
++  // RowContainerRef, use this ptr to see if an existing reference has already
++  // been pinned.
++  // std::weak_ptr<PinnedRowContainer> existingPin_;
++  std::atomic_uint32_t pinCount_{0};
++
++  // This represents the path to the file on disk for this container.
++  std::optional<SpilledBlockFile> spillFile_;
++
++  // This represents the next container in the LRU list.
++  std::weak_ptr<RowContainerRef> lruNext_;
++
++  // This represents the previous container in the LRU list.
++  std::weak_ptr<RowContainerRef> lruPrev_;
++
++  // the row type when spilled to disk.
++  RowTypePtr spillRowType_;
++  MemoryPool* spillMemoryPool_;
++
++  // lock is required for any operations that read or write this container.
++  std::recursive_mutex lock_;
++};
++
++// The OrderByRowContainer maintains a list of SpillableRowContainers. These
++// containers may be individually spilled or loaded from disk. Each container
++// holds a vector of row container pointers (char*). When spilled to disk, the
++// data contained in the pointers is written out to a file, and subsequently
++// read back into memory when pinned.
++// The usage pattern of this class is as follows:
++//
++// auto container = OrderByRowContainer::addVector()
++// auto pinned = container->pin();
++// auto rows = pinned->getRows();
++// char* row = rows[<i>];
++//
++// The lifetime of the "rows" and "row" variables have to be carefully managed
++// to ensure their lifetime does not outlive the reference to "pinned". Once
++// "pinned" goes out of scope there is no guarantee that the rows referenced by
++// the container will still be valid or point to the same data.
++//
++// The choice of which containers to write out to disk is managed by an LRU
++// list whose head and tail pointers are stored within the OrderByRowContainer.
++class OrderByRowContainer {
++  friend class RowContainerRef;
++  friend class PinnedRowContainer;
++
++ public:
++  OrderByRowContainer(
++      const std::vector<column_index_t>& sortColumnIndices,
++      const std::vector<CompareFlags>& sortCompareFlags,
++      const RowTypePtr& inputType,
++      MemoryPool* pool,
++      const common::SpillConfig* spillConfig,
++      uint64_t maxMemory);
++  ~OrderByRowContainer();
++  static std::vector<char*> addVectorToContainer(
++      const VectorPtr& input,
++      RowContainer* container,
++      std::mutex& rowContainerLock,
++      const std::vector<size_t>& projectionMapping);
++  // Adds a vector into this container and converts it into its own row
++  // container. May cause spilling
++  std::shared_ptr<SpillableRowContainer> addVector(const VectorPtr& rows);
++  std::shared_ptr<SpillableRowContainer> addVectors(
++      const std::vector<VectorPtr>& vectors);
++  // Adds an existing allocated rows from the RowContainer to the pool. May
++  // cause spilling.
++  std::shared_ptr<SpillableRowContainer> addToRowContainer(
++      std::vector<char*>&& allRows);
++  std::unique_ptr<RowContainer> emptyRowContainer();
++  RowContainer* rowContainer() {
++    return rowContainer_.get();
++  }
++  // Releases the container to the caller. Returns <container, numRows>. After
++  // this call the container is invalid and should no longer be used.
++  std::unique_ptr<RowContainer> release();
++
++  void releaseContainer(const std::shared_ptr<RowContainerRef>& container);
++
++  // prints a string representation of the LRU list.
++  std::string dumpLru();
++
++  // Attempt to reclaim memory by spilling existing vectors to disk.
++  //
++  // 'requiredBytes': the amount of memory we are seeking to reclaim
++  uint64_t reclaimMemory(uint64_t requiredBytes);
++  uint64_t evictions() const {
++    return evictions_;
++  }
++
++  uint64_t getMemoryUsage() {
++    return memoryCounter_;
++  }
++  const std::vector<size_t>& projectionMapping() {
++    return projectionMapping_;
++  }
++
++  const RowTypePtr& inputType() {
++    return inputType_;
++  }
++
++  const RowTypePtr& spillType() {
++    return spillType_;
++  }
++
++ private:
++  // pool which tracks memory allocations
++  bytedance::bolt::memory::MemoryPool* pool_;
++  uint64_t maxMemory_;
++  // The type that is expected of vectors in the addVector function
++  RowTypePtr inputType_;
++  // parent directory where spill files should go.
++  std::string spillPath_;
++  const common::SpillConfig* const spillConfig_;
++  // the storage type in the row container. Generally it is ( <sorted columns |
++  // <unsorted columns> )
++  RowTypePtr rowContainerType_;
++  // ordered list of the sorted columns as they appear in the row container
++  std::vector<TypePtr> sortedColumnTypes_;
++  // ordered list of the un-sorted fields as they appear in the row container
++  std::vector<TypePtr> nonSortedColumnTypes_;
++  // ordered vector where the index in the vector corresponds to the output
++  // type index. The value at a particular index is the input type position.
++  std::vector<size_t> projectionMapping_;
++  // type of vector spilled to disk.
++  RowTypePtr spillType_;
++  std::unique_ptr<RowContainer> rowContainer_;
++  std::mutex rowContainerLock_;
++
++  // Mapping of container ID to container.
++  std::unordered_map<uint64_t, std::shared_ptr<RowContainerRef>> containers_;
++
++  // LRU list pointers. This should only contain containers which are not
++  // spilled to disk.
++  // head is most-recently used
++  std::weak_ptr<RowContainerRef> head_;
++  // tail is least-recently used
++  std::weak_ptr<RowContainerRef> tail_;
++
++  // Add to head (most recent) of LRU list. Locks the class
++  void addToLRU(uint64_t id);
++  // Remove the node from the LRU list. Locks the class
++  void removeFromLRU(uint64_t id);
++  // Verifies that current memory usage is below the threshold. If it is above
++  // the maxMemory_ threshold, evicts items from the LRU list and spills them
++  // to disk. If maxMemory_ is 0, no spilling will occur, and reclamation will
++  // never happen.
++  // If reclamation must occur, locks the class.
++  void checkMemoryUsage();
++
++  // lock required when making modifications to containers_ or any part of the
++  // LRU list.
++  std::recursive_mutex lock_;
++  // mutex to prevent threads concurrently reclaiming memory
++  std::mutex reclaimLock_;
++  // incremented when a new container is allocated.
++  std::atomic<uint64_t> idCounter_;
++  // Used for tracking memory utilization
++  std::atomic<uint64_t> memoryCounter_;
++  // metrics
++  // number of container evictions (sometimes spilled to disk)
++  uint64_t evictions_;
++};
++
++} // namespace bytedance::bolt::exec
+diff --git a/bolt/exec/RowContainer.cpp b/bolt/exec/RowContainer.cpp
+index 9412a2dbdc..1e9be9bc26 100644
+--- a/bolt/exec/RowContainer.cpp
++++ b/bolt/exec/RowContainer.cpp
+@@ -762,9 +762,16 @@ void RowContainer::extractSerializedRows(
+ void RowContainer::copySerializedRow(
+     char* const serializedRow,
+     RowFormatInfo* const info) {
++  copySerializedRow(serializedRow, info->fixRowSize, info->variableColumns);
++}
++
++char* RowContainer::copySerializedRow(
++    char* const serializedRow,
++    size_t fixedRowSize,
++    const std::vector<std::pair<bool, RowColumn>>& variableColumns) {
+   auto newRow = this->newRow();
+-  memcpy(newRow, serializedRow, info->fixRowSize);
+-  for (const auto& [isStr, rowColumn] : info->variableColumns) {
++  memcpy(newRow, serializedRow, fixedRowSize);
++  for (const auto& [isStr, rowColumn] : variableColumns) {
+     if (RowContainer::isNullAt(serializedRow, rowColumn)) {
+       continue;
+     }
+@@ -792,6 +799,7 @@ void RowContainer::copySerializedRow(
+           reinterpret_cast<char*>(position.position), sv.size());
+     }
+   }
++  return newRow;
+ }
+ 
+ void RowContainer::storeSerializedRow(
+diff --git a/bolt/exec/RowContainer.h b/bolt/exec/RowContainer.h
+index 7c81f22cc2..85530fc7dd 100644
+--- a/bolt/exec/RowContainer.h
++++ b/bolt/exec/RowContainer.h
+@@ -415,6 +415,12 @@ class RowContainer {
+ 
+   // copy one row from other memory pool
+   void copySerializedRow(char* const, RowFormatInfo* const);
++  // copy one row from other memory pool
++  // return the pointer to the new row
++  char* copySerializedRow(
++      char* const serializedRow,
++      size_t fixedRowSize,
++      const std::vector<std::pair<bool, RowColumn>>& variableColumns);
+ 
+   /// Copies the values at 'col' into 'result' (starting at 'resultOffset')
+   /// for the 'numRows' rows pointed to by 'rows'. If a 'row' is null, sets
+diff --git a/bolt/exec/SortBufferMergePath.cpp b/bolt/exec/SortBufferMergePath.cpp
+new file mode 100644
+index 0000000000..d79851c356
+--- /dev/null
++++ b/bolt/exec/SortBufferMergePath.cpp
+@@ -0,0 +1,1081 @@
++/*
++ * Copyright (c) Facebook, Inc. and its affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "bolt/exec/SortBufferMergePath.h"
++#include <exec/Operator.h>
++
++#include <algorithm>
++
++#include <utility>
++
++#include "bolt/exec/SortBuffer.h"
++#include "bolt/exec/Task.h"
++#include "bolt/vector/FlatVector.h"
++
++namespace {
++
++std::vector<std::pair<bool, bytedance::bolt::exec::RowColumn>>
++computeRowColumns(const bytedance::bolt::exec::RowContainer& container) {
++  std::vector<std::pair<bool, bytedance::bolt::exec::RowColumn>>
++      variableColumns;
++  for (int i = 0; i < container.columnTypes().size(); i++) {
++    auto type = container.columnTypes()[i];
++    if (!type->isFixedWidth()) {
++      bool isStringType = type->kind() == bytedance::bolt::TypeKind::VARCHAR ||
++          type->kind() == bytedance::bolt::TypeKind::VARBINARY;
++      variableColumns.emplace_back(isStringType, container.columns()[i]);
++    }
++  }
++  return variableColumns;
++}
++
++} // namespace
++
++namespace bytedance::bolt::exec {
++SortBufferMergePath::SortBufferMergePath(
++    const RowTypePtr& input,
++    const std::vector<column_index_t>& sortColumnIndices,
++    const std::vector<CompareFlags>& sortCompareFlags,
++    MemoryPool* pool,
++    tsan_atomic<bool>* nonReclaimableSection,
++    const core::QueryConfig* queryConfig,
++    OperatorCtx* operatorCtx,
++    // these parameters may be null
++    const common::SpillConfig* spillConfig,
++    std::shared_ptr<folly::Executor> mergeExecutor)
++    : inputType_(input),
++      sortColumnIndices_(sortColumnIndices),
++      nonReclaimableSection_(nonReclaimableSection),
++      queryConfig_(queryConfig),
++      spillMemoryThreshold_(queryConfig_->orderBySpillMemoryThreshold()),
++      spillConfig_(spillConfig),
++      operatorCtx_(operatorCtx),
++      parallelism_(
++          spillMemoryThreshold_ == 0 ? std::thread::hardware_concurrency()
++                                     : spillMemoryThreshold_),
++      inputVectors_({}),
++      inputVectorMemoryLimit_(
++          spillMemoryThreshold_ != 0 ? spillMemoryThreshold_ / parallelism_
++                                     : 256L << 20),
++      mergeExecutor_(std::move(mergeExecutor)) {
++  // minimum target memory is 1MB regardless of what user sets. Otherwise,
++  // if spilling is allowed, divide the spill memory threshold by 128 for higher
++  // parallelism. If it's not set, use a container target size of 128MB
++  targetContainerMemory_ = std::max(
++      1UL << 20,
++      spillMemoryThreshold_ == 0 ? 32UL << 20 : spillMemoryThreshold_ / 128);
++  sortCompareFlags_ = sortCompareFlags;
++  pool_ = pool;
++  sorter_ = HybridSorter();
++  BOLT_CHECK(pool_->trackUsage());
++  rowContainer_ = std::make_unique<OrderByRowContainer>(
++      sortColumnIndices,
++      sortCompareFlags,
++      input,
++      pool_,
++      spillConfig,
++      spillMemoryThreshold_);
++
++  auto* tmpContainer = rowContainer_->rowContainer();
++  variableColumns_ = computeRowColumns(*tmpContainer);
++  computeJitCmpFunction(
++      rowContainer_->rowContainer(), operatorCtx_, sortCompareFlags_);
++}
++
++// returns true if left < right
++static bool cmpLess(
++    const char* leftRow,
++    const char* rightRow,
++    RowContainer* rowContainer,
++    const std::vector<CompareFlags>& sortCompareFlags) {
++  for (vector_size_t index = 0; index < sortCompareFlags.size(); ++index) {
++    if (auto result = rowContainer->compare(
++            leftRow, rightRow, index, sortCompareFlags[index])) {
++      return result < 0;
++    }
++  }
++  return false;
++}
++
++static void sortPinned(
++    const std::shared_ptr<PinnedRowContainer>& pinned,
++    HybridSorter& sorter,
++    const std::vector<CompareFlags>& sortCompareFlags,
++    const RowRowCompare cmp) {
++  auto* container = pinned->getRowContainer();
++  auto& rows = pinned->getRows();
++  if (!cmp) {
++    sorter.template sort(
++        rows.begin(),
++        rows.end(),
++        [container, sortCompareFlags](
++            const char* leftRow, const char* rightRow) {
++          return cmpLess(leftRow, rightRow, container, sortCompareFlags);
++        });
++
++  } else {
++    sorter.template sort(
++        rows.begin(),
++        rows.end(),
++        [cmp](const char* leftRow, const char* rightRow) {
++          return cmp(leftRow, rightRow);
++        });
++  }
++}
++
++// returns < 0, 0, or >0 if the row at idx is <, =, or > than other_idx inside
++// of other aIdx and bIdx must be valid indexes into aPinned and bPinned
++// respectively.
++static bool compareLess(
++    uint64_t aIdx,
++    const std::shared_ptr<PinnedRowContainer>& aPinned,
++    uint64_t bIdx,
++    const std::shared_ptr<PinnedRowContainer>& bPinned,
++    const SortBufferMergePath*& op) {
++  char* rowA = aPinned->getRows()[aIdx];
++  char* rowB = bPinned->getRows()[bIdx];
++  if (op->cmp()) {
++    auto result = op->cmp()(rowA, rowB);
++    return result;
++  }
++  return aPinned->getRowContainer()->compareRows(
++             rowA, rowB, op->getSortCompareFlags()) < 0;
++}
++
++static bool compareLessGlobal(
++    uint64_t aGlobalIdx,
++    std::shared_ptr<OrderedContainer>& a,
++    uint64_t& aLastContainerIdx,
++    std::shared_ptr<PinnedRowContainer>& aCurrentPinned,
++    uint64_t bGlobalIdx,
++    std::shared_ptr<OrderedContainer>& b,
++    uint64_t& bLastContainerIdx,
++    std::shared_ptr<PinnedRowContainer>& bCurrentPinned,
++    const SortBufferMergePath*& op) {
++  auto [aContainerIdx, aCompareIdx] = a->getContainerIdx(aGlobalIdx);
++  auto [bContainerIdx, bCompareIdx] = b->getContainerIdx(bGlobalIdx);
++  auto aPinned = a->sortedContainers_[aContainerIdx]->pin();
++  auto bPinned = b->sortedContainers_[bContainerIdx]->pin();
++  BOLT_CHECK_LT(
++      aCompareIdx,
++      aPinned->getRows().size(),
++      "aCompareIdx out of container bounds: {}",
++      a->toString());
++  char* rowA = aPinned->getRows()[aCompareIdx];
++  BOLT_CHECK_LT(
++      bCompareIdx,
++      bPinned->getRows().size(),
++      "bCompareIdx out of container bounds: {}",
++      b->toString());
++  char* rowB = bPinned->getRows()[bCompareIdx];
++  if (op->cmp()) {
++    return op->cmp()(rowA, rowB);
++  }
++  auto& sortComplareFlags = op->getSortCompareFlags();
++  return cmpLess(rowA, rowB, aPinned->getRowContainer(), sortComplareFlags);
++}
++
++static bool verifyContainerIsSorted(
++    std::shared_ptr<OrderedContainer> a,
++    const SortBufferMergePath* op) {
++  std::shared_ptr<PinnedRowContainer> prevPin = a->sortedContainers_[0]->pin();
++  std::shared_ptr<PinnedRowContainer> currentPin;
++  bool sorted = true;
++  char* prevRow = nullptr;
++  for (auto& container : a->sortedContainers_) {
++    auto pinned = container->pin();
++    auto rowContainer = pinned->getRowContainer();
++    for (int i = 0; i < pinned->getRows().size(); i++) {
++      char* row = pinned->getRows()[i];
++      if (prevRow == nullptr) {
++        continue;
++      }
++      if (cmpLess(row, prevRow, rowContainer, op->getSortCompareFlags())) {
++        // checks if current row < prevRow
++        LOG(ERROR) << "Container is not sorted at index: " << i;
++        return false;
++      }
++      prevRow = row;
++    }
++  }
++  return sorted;
++}
++
++void SortBufferMergePath::addSortTask(const CollectedVectors&& vector) {
++  {
++    std::lock_guard lock(addInputTasksMutex_);
++    pendingTasks_++;
++  }
++
++  mergeExecutor_->add([vector, this]() {
++    auto container = rowContainer_->addVectors(vector.vectors_);
++    auto pinned = container->pin();
++    auto& rows = pinned->getRows();
++    for (int i = 0; i < rows.size(); i++) {
++      if (rows[i] == nullptr) {
++        BOLT_FAIL("Null row found at index {} before sorting", i);
++      }
++    }
++    sortPinned(pinned, sorter_, sortCompareFlags_, cmp_);
++    {
++      std::lock_guard<std::mutex> lock(containersLock_);
++      containers_.push_back(container);
++    }
++    // Decrement pending tasks and notify if all are complete
++    {
++      std::lock_guard lock(addInputTasksMutex_);
++      pendingTasks_--;
++      if (pendingTasks_ == 0) {
++        addInputTasksCv_.notify_one();
++      }
++    }
++  });
++}
++
++void SortBufferMergePath::addInput(const VectorPtr& input) {
++  // The vector must be loaded before potentially sending off to other
++  // threads for sorting. Readers aren't guaranteed to be thread-safe
++  input->loadedVector();
++  if (input->size() <= 0) {
++    return;
++  }
++  reserveSpace(
++      input,
++      rowContainer_->rowContainer(),
++      spillConfig_,
++      pool_,
++      nonReclaimableSection_);
++  CollectedVectors rowInput;
++  bool addTask = false;
++  {
++    std::lock_guard lock(addInputTasksMutex_);
++    vectorCount_++;
++    inputVectors_.vectors_.push_back(input);
++    inputVectors_.estimatedFlatSize_ += input->estimateFlatSize();
++    // check if we need to send the vector off for sorting.
++    // if so, send it off. Afterwards, set the new inputVector_ here to the new
++    // vector. Otherwise, append the new vector to the current one.
++    if (inputVectors_.estimatedFlatSize_ > inputVectorMemoryLimit_) {
++      rowInput = std::move(inputVectors_);
++      inputVectors_ = {};
++      addTask = true;
++    }
++  }
++  // separated due to locking
++  if (addTask) {
++    addSortTask(std::move(rowInput));
++  }
++
++  numInputRows_ += input->size();
++}
++
++void SortBufferMergePath::reclaim(uint64_t targetBytes) {
++  rowContainer_->reclaimMemory(targetBytes);
++}
++
++OrderedContainer::OrderedContainer(
++    uint64_t totalRecords,
++    std::vector<std::shared_ptr<SpillableRowContainer>>&& containers,
++    std::vector<uint64_t>&& indexes)
++    : sortedContainers_(std::move(containers)),
++      indexes_(std::move(indexes)),
++      totalRecords_(totalRecords) {}
++
++std::pair<uint64_t, uint64_t> OrderedContainer::getContainerIdx(
++    uint64_t idx,
++    const std::vector<uint64_t>& indexes) {
++  uint64_t lowIdx = 0;
++  uint64_t maxIdx = indexes.size() - 1;
++  while (true) {
++    uint64_t midIdx = lowIdx + ((maxIdx - lowIdx) / 2);
++    if (idx >= indexes[midIdx]) {
++      if ((midIdx + 1 < indexes.size() && idx < indexes[midIdx + 1]) ||
++          midIdx + 1 == indexes.size()) {
++        return std::pair(midIdx, idx - indexes[midIdx]);
++      }
++      lowIdx = midIdx + 1;
++    } else {
++      maxIdx = midIdx - 1;
++    }
++    if (maxIdx == lowIdx) {
++      return std::pair(maxIdx, idx - indexes[maxIdx]);
++    }
++  }
++}
++std::pair<uint64_t, uint64_t> OrderedContainer::getContainerIdx(
++    uint64_t idx) const {
++  return getContainerIdx(idx, indexes_);
++}
++
++std::shared_ptr<OrderedContainer> OrderedContainer::newContainer(
++    std::shared_ptr<SpillableRowContainer> container) {
++  auto records = container->numRows();
++  return std::make_shared<OrderedContainer>(
++      records, std::vector{std::move(container)}, std::vector<uint64_t>{0});
++}
++
++std::shared_ptr<OrderedContainer> OrderedContainer::merge(
++    const std::vector<std::shared_ptr<OrderedContainer>>& containers) {
++  // compute new total_records_ for the merged container.
++  std::uint64_t newTotalRecords = 0;
++  for (const auto& container : containers) {
++    newTotalRecords += container->totalRecords_;
++  }
++  // compute new indexes_ for the merged container.
++  // the first container maintains it's indexes array. The subsequent indexes
++  // are concatenated on to the new index array, but their values are offset
++  // by the total_records_ of the previous containers.
++  std::vector<uint64_t> newIndexes = containers[0]->indexes_;
++  uint64_t currentTotalRecords = containers[0]->totalRecords_;
++  // skip first container in loop
++  for (const auto& container : containers) {
++    if (container == containers[0]) {
++      continue;
++    }
++    // transform all indexes in container by adding the total_records_ of the
++    // previous container.
++    std::vector<uint64_t> tmpIndexes(container->indexes_.size());
++    std::transform(
++        container->indexes_.begin(),
++        container->indexes_.end(),
++        tmpIndexes.begin(),
++        [currentTotalRecords](uint64_t idx) {
++          return idx + currentTotalRecords;
++        });
++    newIndexes.insert(newIndexes.end(), tmpIndexes.begin(), tmpIndexes.end());
++    currentTotalRecords += container->totalRecords_;
++  }
++
++  // concatenate all internal containers
++  std::vector<std::shared_ptr<SpillableRowContainer>> newSortedContainers;
++  for (const auto& container : containers) {
++    newSortedContainers.insert(
++        newSortedContainers.end(),
++        container->sortedContainers_.begin(),
++        container->sortedContainers_.end());
++  }
++  return std::make_shared<OrderedContainer>(
++      newTotalRecords, std::move(newSortedContainers), std::move(newIndexes));
++}
++
++std::string OrderedContainer::toString() const {
++  // create a comma-separated string from ordered container indexes_
++  std::string containerIdxStr = fmt::format("{}", fmt::join(indexes_, ","));
++  std::string containerRowCounts = fmt::format(
++      "{}",
++      fmt::join(
++          [&]() {
++            std::vector<std::string> rowCounts;
++            rowCounts.reserve(sortedContainers_.size());
++            std::transform(
++                sortedContainers_.begin(),
++                sortedContainers_.end(),
++                std::back_inserter(rowCounts),
++                [](const std::shared_ptr<SpillableRowContainer>& container) {
++                  return fmt::format("{}", container->numRows());
++                });
++            return rowCounts;
++          }(),
++          ","));
++  return fmt::format(
++      "OrderedContainer(totalRecords={}, \nindexes={}, \nrowCounts={})",
++      totalRecords_,
++      containerIdxStr,
++      containerRowCounts);
++}
++
++struct Boundary {
++  size_t begin = 0;
++  size_t end = 0;
++};
++
++template <class T>
++static T alignValue(T n, T val) {
++  return ((n + (val - 1)) / val) * val;
++}
++
++static size_t compuateBoundaryDelta(
++    const size_t& total_remaining,
++    const size_t& k,
++    const Boundary& run_boundary) {
++  const auto runRemaining = run_boundary.end - run_boundary.begin;
++  return std::min(alignValue(total_remaining, k) / k, runRemaining);
++}
++
++// This implements the K-way merge from the DuckDB blog post, but
++// just for the specific case of 2 vectors.
++// Arguments:
++//   - a: input ordered container
++//   - b: 2nd input ordered container.
++//   - threadIdx: 0-indexed identifier of the thread computing this partition
++//   - totalPartitions: the total number of partitions that will be computed
++//   (this method computes just one)
++//   - op: reference to parent
++//   - lastPartition: the previous partition's computed values
++static std::pair<uint64_t, uint64_t> calculatePartitionPoint_DDB(
++    const std::shared_ptr<OrderedContainer>& a,
++    const std::shared_ptr<OrderedContainer>& b,
++    const uint32_t threadIdx,
++    const uint32_t totalPartitions,
++    const SortBufferMergePath* op,
++    const std::pair<uint64_t, uint64_t>& lastPartition) {
++  auto partitionSize = (a->totalRecords_ + b->totalRecords_) / totalPartitions;
++  size_t totalRemaining = (threadIdx + 1) * partitionSize;
++  std::vector<std::shared_ptr<OrderedContainer>> runs = {a, b};
++  std::vector<size_t> activeRunIdxs = {0, 1};
++  totalRemaining -= lastPartition.first; // index of a's last boundary
++  totalRemaining -= lastPartition.second; // index of b's last boundary
++  std::vector<Boundary> runBoundaries = {
++      {.begin = lastPartition.first, .end = a->totalRecords_},
++      {.begin = lastPartition.second, .end = b->totalRecords_}};
++  std::shared_ptr<PinnedRowContainer> minContainerPinned;
++  uint64_t minContainerLastInnerContainerIdx;
++
++  // while we haven't assigned all records in this partition
++  while (totalRemaining != 0) {
++    const size_t k = runs.size();
++    auto minRunIdx = activeRunIdxs[0];
++    // the minimum amount to move up the pointer for each run
++    auto minDelta =
++        compuateBoundaryDelta(totalRemaining, k, runBoundaries[minRunIdx]);
++    size_t minRowValueIdx = runBoundaries[minRunIdx].begin + minDelta - 1;
++    for (size_t i = 1; i < activeRunIdxs.size(); i++) {
++      const auto& activeRunIdx = activeRunIdxs[i];
++      const auto& runBoundary = runBoundaries[activeRunIdx];
++      const auto runDelta =
++          compuateBoundaryDelta(totalRemaining, k, runBoundary);
++      auto runValueIdx = runBoundary.begin + runDelta - 1;
++      uint64_t bContainerIdx = 0;
++      std::shared_ptr<PinnedRowContainer> bContainer = nullptr;
++      auto less = compareLessGlobal(
++          runValueIdx,
++          runs[activeRunIdx],
++          bContainerIdx,
++          bContainer,
++          minRowValueIdx,
++          runs[minRunIdx],
++          minContainerLastInnerContainerIdx,
++          minContainerPinned,
++          op);
++      if (less) {
++        minRunIdx = activeRunIdx;
++        minDelta = runDelta;
++        minRowValueIdx = runValueIdx;
++        minContainerLastInnerContainerIdx = bContainerIdx;
++      }
++    }
++
++    auto& minRunBoundary = runBoundaries[minRunIdx];
++    minRunBoundary.begin += minDelta;
++
++    if (minRunBoundary.begin == minRunBoundary.end) {
++      activeRunIdxs.erase(std::ranges::find(activeRunIdxs, minRunIdx));
++    }
++
++    BOLT_CHECK(minDelta <= totalRemaining);
++    totalRemaining -= minDelta;
++  }
++
++  // End of boundary is meaningless now, just set equal to begin so there's no
++  // confusion
++  for (auto& runBoundary : runBoundaries) {
++    runBoundary.end = runBoundary.begin;
++  }
++  return {runBoundaries[0].end, runBoundaries[1].end};
++}
++
++std::shared_ptr<OrderedContainer> SortWork::merge() {
++  // absolute indexes within entire sorted container
++  uint32_t aCurrent = aPart.minIdx;
++  uint32_t bCurrent = bPart.minIdx;
++  uint64_t outputRows =
++      (aPart.maxIdx - aPart.minIdx) + (bPart.maxIdx - bPart.minIdx);
++  // current result container
++  RowContainer* currentResultContainer = op->rowContainer_->rowContainer();
++  std::vector<char*> currentResultContainerRows;
++  uint64_t currentRowCount = 0;
++  std::vector<std::shared_ptr<SpillableRowContainer>> results;
++  std::vector<uint64_t> indexes;
++  // first container always starts at 0
++  indexes.push_back(0);
++  // *_idx is the index of the container in the sorted_containers_ vector
++  // *_compare_idx is the relative index of the element in the container which
++  // should be compared.
++  auto [aIdx, aCompareIdx] = a->getContainerIdx(aCurrent);
++  auto [bIdx, bCompareIdx] = b->getContainerIdx(bCurrent);
++  // pin the containers if necessary
++  auto aContainer = a->sortedContainers_[aIdx]->pin();
++  auto bContainer = b->sortedContainers_[bIdx]->pin();
++
++  while (aCurrent < aPart.maxIdx && bCurrent < bPart.maxIdx) {
++    // check if a new result container needs to be created.
++    if (currentResultContainerRows.size() *
++            currentResultContainer->fixedRowSize() >=
++        op->targetContainerMemory_) {
++      uint64_t lastRowsCount = currentResultContainerRows.size();
++      std::shared_ptr<SpillableRowContainer> resultContainer =
++          op->rowContainer_->addToRowContainer(
++              std::move(currentResultContainerRows));
++      results.push_back(resultContainer);
++      indexes.push_back(currentRowCount);
++      currentResultContainer = op->rowContainer_->rowContainer();
++      currentResultContainerRows.clear();
++      currentResultContainerRows.reserve(lastRowsCount);
++    }
++
++    // *_compare_idx should be less than the size of the current pinned
++    // container. otherwise, pin a new container, increment a_idx and reset
++    // a_compare_idx to 0.
++    if (aIdx < a->indexes_.size() - 1 && aCurrent >= a->indexes_[aIdx + 1]) {
++      aIdx++;
++      aCompareIdx = 0;
++      aContainer = a->sortedContainers_[aIdx]->pin();
++    }
++    if (bIdx < b->indexes_.size() - 1 && bCurrent >= b->indexes_[bIdx + 1]) {
++      bIdx++;
++      bCompareIdx = 0;
++      bContainer = b->sortedContainers_[bIdx]->pin();
++    }
++    if (compareLess(aCompareIdx, aContainer, bCompareIdx, bContainer, op)) {
++      auto& tmpRows = aContainer->getRows();
++      BOLT_CHECK_NE(
++          tmpRows[aCompareIdx],
++          nullptr,
++          "nullptr at global index {} in container {} at containerIdx {}",
++          aCurrent,
++          aIdx,
++          aCompareIdx);
++      currentResultContainerRows.push_back(tmpRows[aCompareIdx]);
++      aCurrent++;
++      aCompareIdx++;
++    } else {
++      auto& tmpRows = bContainer->getRows();
++      BOLT_CHECK_NE(
++          tmpRows[bCompareIdx],
++          nullptr,
++          "nullptr at global index {} in container {} at containerIdx {}",
++          bCurrent,
++          bIdx,
++          bCompareIdx);
++      currentResultContainerRows.push_back(tmpRows[bCompareIdx]);
++      bCurrent++;
++      bCompareIdx++;
++    }
++    currentRowCount++;
++  }
++  // there may be rows left in a or b. Copy the remaining rows from the
++  // current idx in the remaining vector into the final result containers.
++  uint64_t currentIdx;
++  uint64_t currentContainerIdx;
++  uint64_t currentCompareIdx;
++  uint64_t maxIdx;
++  std::shared_ptr<OrderedContainer> remainingRecords;
++  std::shared_ptr<PinnedRowContainer> remainingPinned;
++  if (aCurrent < aPart.maxIdx) {
++    currentIdx = aCurrent;
++    currentContainerIdx = aIdx;
++    currentCompareIdx = aCompareIdx;
++    maxIdx = aPart.maxIdx;
++    remainingRecords = a;
++    remainingPinned = aContainer;
++  } else {
++    currentIdx = bCurrent;
++    currentContainerIdx = bIdx;
++    currentCompareIdx = bCompareIdx;
++    maxIdx = bPart.maxIdx;
++    remainingRecords = b;
++    remainingPinned = bContainer;
++  }
++  while (currentIdx < maxIdx) {
++    // create a new result container if required
++    if (currentResultContainerRows.size() *
++            currentResultContainer->fixedRowSize() >=
++        op->targetContainerMemory_) {
++      size_t lastRowCount = currentResultContainerRows.size();
++      std::shared_ptr<SpillableRowContainer> resultContainer =
++          op->rowContainer_->addToRowContainer(
++              std::move(currentResultContainerRows));
++      results.push_back(resultContainer);
++      indexes.push_back(currentRowCount);
++      currentResultContainer = op->rowContainer_->rowContainer();
++      currentResultContainerRows.clear();
++      currentResultContainerRows.reserve(lastRowCount);
++    }
++    // pin a new container if required
++    if (currentContainerIdx < remainingRecords->indexes_.size() - 1 &&
++        currentIdx >= remainingRecords->indexes_[currentContainerIdx + 1]) {
++      currentContainerIdx++;
++      currentCompareIdx = 0;
++      remainingPinned =
++          remainingRecords->sortedContainers_[currentContainerIdx]->pin();
++    }
++    BOLT_CHECK(currentCompareIdx < remainingPinned->getRows().size());
++    auto& tmpRows = remainingPinned->getRows();
++    BOLT_CHECK_NE(
++        tmpRows[currentCompareIdx],
++        nullptr,
++        "nullptr at global index {} in container {} at containerIdx {}",
++        currentIdx,
++        currentContainerIdx,
++        currentCompareIdx);
++    currentResultContainerRows.push_back(tmpRows[currentCompareIdx]);
++    currentIdx++;
++    currentCompareIdx++;
++    currentRowCount++;
++  }
++  if (currentResultContainerRows.size() > 0) {
++    std::shared_ptr<SpillableRowContainer> resultContainer =
++        op->rowContainer_->addToRowContainer(
++            std::move(currentResultContainerRows));
++    results.push_back(resultContainer);
++  }
++#ifndef NDEBUG
++  BOLT_CHECK_EQ(
++      outputRows,
++      currentRowCount,
++      "Output rows does not match expected: {}",
++      this->toString());
++#endif
++  // check if any rows in results are null. Use integer indexing and log
++  // container and row index where it occurs
++  uint64_t rowIdx = 0;
++  uint64_t containerIdx = 0;
++  for (auto& resultContainer : results) {
++    auto& rows = resultContainer->pin()->getRows();
++    for (auto& row : rows) {
++      BOLT_CHECK_NE(
++          row, nullptr, "nullptr in result container at row index {}", rowIdx);
++      rowIdx++;
++    }
++    containerIdx++;
++  }
++  auto merged = std::make_shared<OrderedContainer>(
++      currentRowCount, std::move(results), std::move(indexes));
++#ifndef NDEBUG
++  verifyContainerIsSorted(merged, op);
++#endif
++  return merged;
++}
++
++static std::vector<SortWork> getMergeJobs(
++    const std::shared_ptr<OrderedContainer>& a,
++    const std::shared_ptr<OrderedContainer>& b,
++    vector_size_t numPartitions,
++    const SortBufferMergePath* op) {
++  // If the total length of the combined vectors is less than our threshold,
++  // then we simply combine via a single thread. Otherwise, determine the total
++  // number of partitions then, calculate the merge path intersection points
++  // based on the merge path algorithm.
++
++  uint64_t minPartitions = std::min(
++      // generally numPartitions is small (on the range of cores in a single
++      // machine) so this cast up to uint64_t and back down to uint32_t later
++      // should be safe.
++      static_cast<uint64_t>(numPartitions),
++      a->totalRecords_ + b->totalRecords_);
++
++  uint32_t partitions =
++      std::max(static_cast<uint32_t>(1), static_cast<uint32_t>(minPartitions));
++  std::vector<std::pair<uint64_t, uint64_t>> mergePoints(partitions);
++  if (partitions > 1) {
++    std::pair<uint64_t, uint64_t> lastPoint = {0, 0};
++    for (uint32_t i = 0; i < partitions - 1;
++         i++) { // the final point is the end of the array.
++      mergePoints[i] =
++          calculatePartitionPoint_DDB(a, b, i, partitions, op, lastPoint);
++      lastPoint = mergePoints[i];
++#ifndef NDEBUG
++      // validate that mergePoints[i] is > than the previous iteration for both
++      // pairs.
++      // If it isn't then re-run the calculation for the previous and current
++      // pair. This will cause an infinite loop. In a correct implementation
++      // this should never occur.
++      if (i > 0 &&
++          (mergePoints[i].first < mergePoints[i - 1].first ||
++           mergePoints[i].second < mergePoints[i - 1].second)) {
++        LOG(ERROR)
++            << "Inconsistent merge point calculation. Re-running calculation for partition: "
++            << i << " with points: " << mergePoints[i].first << ", "
++            << mergePoints[i].second;
++        verifyContainerIsSorted(a, op);
++        verifyContainerIsSorted(b, op);
++        i -= 2;
++      }
++#endif
++    }
++    mergePoints[partitions - 1] = {a->totalRecords_, b->totalRecords_};
++  } else {
++    mergePoints[0] = {a->totalRecords_, b->totalRecords_};
++  }
++
++  uint32_t lastAPoint = 0;
++  uint32_t lastBPoint = 0;
++  std::vector<SortWork> sortJobs;
++  sortJobs.reserve(mergePoints.size());
++  for (auto& mergePoint : mergePoints) {
++    ArrayPartition nextAPartition = {
++        .minIdx = lastAPoint, .maxIdx = mergePoint.first};
++    ArrayPartition nextBPartition = {
++        .minIdx = lastBPoint, .maxIdx = mergePoint.second};
++    if (nextAPartition.maxIdx < nextAPartition.minIdx ||
++        nextBPartition.maxIdx < nextBPartition.minIdx) {
++      std::vector<std::string> formattedPoints;
++      formattedPoints.reserve(mergePoints.size());
++      for (const auto& p : mergePoints) {
++        formattedPoints.push_back(fmt::format("[{}, {}]", p.first, p.second));
++      }
++      std::string err = fmt::format(
++          "Invalid partition range for A: [{}, {}] for B: [{}, {}],"
++          "Full mergepoint arr: {}",
++          nextAPartition.minIdx,
++          nextAPartition.maxIdx,
++          nextBPartition.minIdx,
++          nextBPartition.maxIdx,
++          fmt::join(formattedPoints, ", "));
++      BOLT_USER_CHECK_GE(
++          nextAPartition.maxIdx, nextAPartition.minIdx, "{}", err);
++      BOLT_USER_CHECK_GE(
++          nextBPartition.maxIdx, nextBPartition.minIdx, "{}", err);
++    }
++    sortJobs.emplace_back(a, b, nextAPartition, nextBPartition, op);
++    lastAPoint = nextAPartition.maxIdx;
++    lastBPoint = nextBPartition.maxIdx;
++  }
++  return sortJobs;
++}
++
++void SortBufferMergePath::waitForPendingTasks() {
++  std::unique_lock<std::mutex> lock(addInputTasksMutex_);
++  addInputTasksCv_.wait(lock, [this]() { return pendingTasks_ == 0; });
++}
++
++void SortBufferMergePath::flushExistingVectors() {
++  // collect the remaining vectors, sort them, and then append them to the
++  // current vector.
++  if (!inputVectors_.vectors_.empty()) {
++    addSortTask(std::move(inputVectors_));
++  }
++
++  // make sure no more tasks from addInput are executing:
++  uint64_t usecs = 0;
++  {
++    MicrosecondTimer timer(&usecs);
++    waitForPendingTasks();
++  }
++  blockedOnSortingNoMoreInputTimer_ += usecs;
++}
++
++void SortBufferMergePath::noMoreInput() {
++  LOG(INFO) << "No more input called!";
++  {
++    MicrosecondTimer flushTimer(&sortStats_.sortColToRowTimeUs);
++    flushExistingVectors();
++  }
++  MicrosecondTimer iterationTime(&sortStats_.sortInSortTimeUs);
++  LOG(INFO) << "Finished flushing existing sort jobs";
++  // Parallel Sorting Algorithm
++  // Set up:
++  // assume all of our spilled containers are pre-sorted, create a stack of
++  // work
++  std::stack<std::shared_ptr<OrderedContainer>> orderedContainers;
++  for (const auto& container : containers_) {
++    auto orderedContainer = OrderedContainer::newContainer(container);
++    LOG(INFO) << "Starting container: " << orderedContainer->toString();
++    orderedContainers.push(orderedContainer);
++  }
++  // the original container are no longer required. Clear the vec to allow
++  // releasing sooner
++  containers_.clear();
++  // now we have a stack of ordered vectors.
++  // we merge them by combining two containers together until we only have a
++  // single sorted container
++
++  uint64_t iter = 0;
++  while (orderedContainers.size() > 1) {
++    iter++;
++
++    // gather all pairs of vectors, combine, and then push back to the stack.
++    std::vector<std::tuple<
++        std::shared_ptr<OrderedContainer>,
++        std::shared_ptr<OrderedContainer>>>
++        pairs;
++    while (orderedContainers.size() > 1) {
++      auto a = orderedContainers.top();
++      orderedContainers.pop();
++      auto b = orderedContainers.top();
++      orderedContainers.pop();
++      pairs.emplace_back(a, b);
++    }
++
++    // Submit all tasks to executor and collect futures
++    std::vector<folly::Future<std::shared_ptr<OrderedContainer>>> futures;
++    futures.reserve(pairs.size());
++    uint32_t maxParallelismPerPair =
++        std::max(static_cast<uint32_t>(parallelism_ / pairs.size()), 1U);
++
++    for (const auto& pair : pairs) {
++      auto task =
++          folly::via(
++              mergeExecutor_.get(),
++              [this, iter, maxParallelismPerPair, pair = std::move(pair)]() {
++                auto a = std::get<0>(pair);
++                auto b = std::get<1>(pair);
++                auto jobs = getMergeJobs(a, b, maxParallelismPerPair, this);
++#ifndef NDEBUG
++                auto pairRows = a->totalRecords_ + b->totalRecords_;
++                uint64_t totalRows = 0;
++                for (auto& job : jobs) {
++                  totalRows += job.aPart.maxIdx - job.aPart.minIdx +
++                      job.bPart.maxIdx - job.bPart.minIdx;
++                }
++                BOLT_CHECK_EQ(
++                    totalRows, pairRows, "changed row count on iter {}", iter);
++#endif
++                return jobs;
++              })
++              .thenValue([this](auto&& jobs) {
++                // Add the sort jobs to the executor and make a future which
++                // finishes once all sort jobs are complete.
++                std::vector<folly::Future<std::shared_ptr<OrderedContainer>>>
++                    jobFutures;
++                jobFutures.reserve(jobs.size());
++
++                for (auto& job : jobs) {
++                  auto jobPtr = std::make_shared<SortWork>(std::move(job));
++                  jobFutures.push_back(folly::via(
++                      mergeExecutor_.get(),
++                      [jobPtr]() { return jobPtr->merge(); }));
++                }
++
++                // At the end of that future, a new callback should run which
++                // executes the actual merge operation.
++                return folly::collectAll(jobFutures)
++                    .via(mergeExecutor_.get())
++                    .thenValue([](auto&& results) {
++                      std::vector<std::shared_ptr<OrderedContainer>> merged;
++                      merged.reserve(results.size());
++
++                      // Wait for all futures to complete and collect results in
++                      // order
++                      for (auto& result : results) {
++                        merged.push_back(std::move(result).value());
++                      }
++
++                      return OrderedContainer::merge(merged);
++                    });
++              });
++      futures.push_back(std::move(task));
++    }
++    auto merged = folly::collectAll(futures).get();
++
++    for (auto& container : merged) {
++      if (container.hasException()) {
++        auto& exception = container.exception();
++        LOG(ERROR) << "Merge Path failed. Task threw exception: "
++                   << exception.what();
++        exception.throw_exception();
++      }
++      orderedContainers.push(container.value());
++    }
++#ifndef NDEBUG
++    // verify total row count
++    uint64_t rowCount = 0;
++    auto tmpStack = orderedContainers;
++    while (!tmpStack.empty()) {
++      auto current = tmpStack.top();
++      rowCount += current->totalRecords_;
++      // Process current element
++      tmpStack.pop(); // This only affects the temporary copy
++    }
++    BOLT_CHECK_EQ(
++        rowCount, numInputRows_, "Increased row count on iter {}", iter);
++#endif
++  }
++
++  if (orderedContainers.size() == 1) {
++#ifndef NDEBUG
++    verifyContainerIsSorted(orderedContainers.top(), this);
++#endif
++    orderedContainers_ = std::deque(
++        orderedContainers.top()->sortedContainers_.begin(),
++        orderedContainers.top()->sortedContainers_.end());
++  } else if (orderedContainers.size() > 1) {
++    // no inputs
++    BOLT_FAIL(
++        "Must only have a single sorted container. Found {} containers",
++        orderedContainers.size());
++  }
++
++#ifndef NDEBUG
++  uint64_t rowCount = 0;
++  for (auto& item : orderedContainers_) {
++    rowCount += item->numRows();
++  }
++  BOLT_CHECK_EQ(rowCount, numInputRows_);
++#endif
++  noMoreInput_ = true;
++  pool_->release();
++}
++
++RowVectorPtr SortBufferMergePath::getOutput(uint32_t maxOutputRows) {
++  MicrosecondTimer iterationTime(&sortStats_.sortOutputTimeUs);
++  if (finished_ || !noMoreInput_) {
++    return nullptr;
++  }
++
++  if (currentOutputRows_.empty() ||
++      currentOutputRows_.size() - currentOutputContainerIndex_ <
++          maxOutputRows) {
++    std::vector<char*> currentRowBuffer;
++    currentRowBuffer.reserve(maxOutputRows);
++    currentRowBuffer.insert(
++        currentRowBuffer.end(),
++        currentOutputRows_.begin() + currentOutputContainerIndex_,
++        currentOutputRows_.end());
++    currentOutputContainerIndex_ = 0;
++    while (currentRowBuffer.size() < maxOutputRows) {
++      if (orderedContainers_.empty()) {
++        break;
++      }
++      auto container = orderedContainers_.front();
++      orderedContainers_.pop_front();
++      auto pinned = container->pin();
++      if (!estimatedOutputRowSize_.has_value()) {
++        estimatedOutputRowSize_ = pinned->getRowContainer()->estimateRowSize();
++      }
++      auto rows = pinned->exportRows();
++      currentRowBuffer.insert(
++          currentRowBuffer.end(), rows.data(), rows.data() + rows.size());
++    }
++    currentOutputRows_ = std::move(currentRowBuffer);
++  }
++  convertSpillableToRowVectorPtr(currentOutputRows_, maxOutputRows, pool_);
++  finished_ = output_ == nullptr;
++  if (finished_) {
++    return nullptr;
++  }
++
++  return output_;
++}
++
++void SortBufferMergePath::convertSpillableToRowVectorPtr(
++    const std::vector<char*>& rows,
++    uint64_t maxOutputRows,
++    MemoryPool* pool) {
++  if (rows.empty()) {
++    output_ = nullptr;
++    return;
++  }
++  auto remainingRows = rows.size() - currentOutputContainerIndex_;
++  auto outputRows = std::min(maxOutputRows, remainingRows);
++
++  // i is the index of the columns in the container, projectionMapping[i] is the
++  // index in the output vector
++  const auto& columnMap = rowContainer_->projectionMapping();
++  auto outputType = rowContainer_->inputType();
++  if (output_ != nullptr) {
++    VectorPtr output = std::move(output_);
++    BaseVector::prepareForReuse(output, outputRows);
++    output_ = std::static_pointer_cast<RowVector>(output);
++  } else {
++    output_ = std::static_pointer_cast<RowVector>(
++        BaseVector::create(outputType, outputRows, pool));
++  }
++
++  for (auto& child : output_->children()) {
++    child->resize(outputRows);
++  }
++
++  if (currentOutputContainerIndex_ < rows.size()) {
++    char* const* rowPtr = rows.data() + currentOutputContainerIndex_;
++    for (int i = 0; i < columnMap.size(); i++) {
++      rowContainer_->rowContainer()->extractColumn(
++          rowPtr, outputRows, i, output_->childAt(columnMap[i]));
++    }
++  }
++
++  currentOutputContainerIndex_ += outputRows;
++  numOutputRows_ += outputRows;
++  if (std::cmp_greater_equal(currentOutputContainerIndex_, rows.size())) {
++    currentOutputRows_ = {};
++    currentOutputContainerIndex_ = 0;
++  }
++}
++
++void SortBufferMergePath::close() {
++  rowContainer_.reset();
++}
++
++size_t SortBufferMergePath::numInputRows() {
++  return numInputRows_;
++}
++
++size_t SortBufferMergePath::numOutputRows() {
++  return numOutputRows_;
++}
++
++std::optional<uint64_t> SortBufferMergePath::estimateOutputRowSize() const {
++  return estimatedOutputRowSize_;
++}
++
++std::optional<common::SpillStats> SortBufferMergePath::spilledStats() const {
++  return std::nullopt;
++}
++std::optional<common::SpillReadStats> SortBufferMergePath::spillReadStats()
++    const {
++  return std::nullopt;
++}
++std::optional<common::SortStats> SortBufferMergePath::sortStats() const {
++  return sortStats_;
++}
++
++/**
++ * @brief Falls back to single-threaded sorting by creating a new SortBuffer
++ * instance.
++ *
++ * This method waits for all pending sorting tasks to complete and then creates
++ * a new SortBuffer object. It transfers the current row container
++ * to the new buffer and adds any remaining input vectors. Finally, it sets the
++ * number of input rows in the new buffer and returns the buffer.
++ *
++ * This fallback mechanism is used when the data used for sorting no longer fits
++ * in memory. The current multithreaded implementation does not support spilling
++ * to disk, so we must fall back to the single-threaded implementation that does
++ * support spilling.
++ *
++ * @return A pointer to an ISortBuffer object configured with the current
++ *         sorting parameters and containing all the collected input data.
++ */
++std::unique_ptr<ISortBuffer> SortBufferMergePath::fallbackToSingleThread() {
++  waitForPendingTasks();
++  auto buffer = std::make_unique<SortBuffer>(
++      inputType_,
++      sortColumnIndices_,
++      sortCompareFlags_,
++      pool_,
++      nonReclaimableSection_,
++      spillConfig_,
++      spillMemoryThreshold_,
++      operatorCtx_);
++  auto rowContainer = rowContainer_->release();
++  buffer->data_ = std::move(rowContainer);
++  for (auto& vec : inputVectors_.vectors_) {
++    buffer->addInput(vec);
++  }
++  buffer->numInputRows_ = numInputRows_;
++  return buffer;
++}
++
++} // namespace bytedance::bolt::exec
+diff --git a/bolt/exec/SortBufferMergePath.h b/bolt/exec/SortBufferMergePath.h
+new file mode 100644
+index 0000000000..3741acaa15
+--- /dev/null
++++ b/bolt/exec/SortBufferMergePath.h
+@@ -0,0 +1,196 @@
++/*
++ * Copyright (c) Facebook, Inc. and its affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#pragma once
++
++#include "bolt/exec/HybridSorter.h"
++#include "bolt/exec/ISortBuffer.h"
++#include "bolt/exec/Operator.h"
++#include "bolt/exec/OrderByRowContainer.h"
++#include "bolt/exec/RowContainer.h"
++#include "bolt/exec/Spiller.h"
++namespace bytedance::bolt::exec {
++
++struct CollectedVectors {
++  std::vector<VectorPtr> vectors_;
++  uint64_t estimatedFlatSize_{0};
++};
++
++class SortBufferMergePath : public ISortBuffer {
++  friend class SortWork;
++
++ public:
++  SortBufferMergePath(
++      const RowTypePtr& input,
++      const std::vector<column_index_t>& sortColumnIndices,
++      const std::vector<CompareFlags>& sortCompareFlags,
++      MemoryPool* pool,
++      tsan_atomic<bool>* nonReclaimableSection,
++      const core::QueryConfig* queryConfig,
++      exec::OperatorCtx* operatorCtx,
++      const common::SpillConfig* spillConfig = nullptr,
++      std::shared_ptr<folly::Executor> mergeExecutor = nullptr);
++
++  void addInput(const VectorPtr& input) override;
++
++  void noMoreInput() override;
++
++  RowVectorPtr getOutput(uint32_t maxOutputRows) override;
++
++  bool isFinished() const {
++    return finished_;
++  }
++
++  void reclaim(uint64_t targetBytes) override;
++
++  std::optional<uint64_t> estimateOutputRowSize() const override;
++  size_t numInputRows() override;
++  size_t numOutputRows() override;
++  std::optional<common::SpillStats> spilledStats() const override;
++  std::optional<common::SpillReadStats> spillReadStats() const override;
++  std::optional<common::SortStats> sortStats() const override;
++
++  void close();
++  const std::vector<CompareFlags>& getSortCompareFlags() const {
++    return sortCompareFlags_;
++  }
++  RowRowCompare cmp() const {
++    return cmp_;
++  }
++
++  // Moves all internal state into the single-threaded sort buffer
++  // implementation intended to be used when we are out of memory. This object
++  // is invalid after calling this. Do not use after calling this method.
++  std::unique_ptr<ISortBuffer> fallbackToSingleThread();
++
++ private:
++  void convertSpillableToRowVectorPtr(
++      const std::vector<char*>& rows,
++      uint64_t length,
++      MemoryPool* pool);
++  void waitForPendingTasks();
++  void flushExistingVectors();
++  void addSortTask(const CollectedVectors&& vector);
++
++  RowTypePtr inputType_;
++  std::vector<column_index_t> sortColumnIndices_;
++  tsan_atomic<bool>* const nonReclaimableSection_;
++  MemoryPool* pool_;
++  const core::QueryConfig* queryConfig_;
++  const uint64_t spillMemoryThreshold_;
++  const common::SpillConfig* spillConfig_;
++  exec::OperatorCtx* operatorCtx_;
++  std::unique_ptr<OrderByRowContainer> rowContainer_;
++  std::vector<std::shared_ptr<SpillableRowContainer>> containers_;
++  std::mutex containersLock_;
++  uint32_t pendingTasks_{0};
++  uint32_t vectorCount_{0};
++  uint32_t parallelism_;
++  std::vector<std::pair<bool, RowColumn>> variableColumns_;
++  CollectedVectors inputVectors_;
++  uint64_t inputVectorMemoryLimit_;
++  std::mutex addInputTasksMutex_;
++  std::condition_variable addInputTasksCv_;
++  std::vector<CompareFlags> sortCompareFlags_;
++  // represents the queue of sorted containers for output. Empty until
++  // noMoreInput finished
++  std::deque<std::shared_ptr<SpillableRowContainer>> orderedContainers_;
++  // tmp output vector used to store rows returned by getOutput
++  RowVectorPtr output_;
++  // sorter used to sort the input vectors
++  HybridSorter sorter_;
++  bool finished_ = false;
++  bool noMoreInput_ = false;
++  // target amount of memory of each individual sorted container
++  uint32_t targetContainerMemory_;
++  std::shared_ptr<folly::Executor> mergeExecutor_;
++  std::vector<char*> currentOutputRows_;
++  size_t currentOutputContainerIndex_ = 0;
++  // statistics and tracking
++  size_t numInputRows_ = 0;
++  size_t numOutputRows_ = 0;
++  std::optional<uint64_t> estimatedOutputRowSize_;
++  std::atomic_uint64_t blockedOnSortingNoMoreInputTimer_;
++  common::SortStats sortStats_{};
++  std::atomic_uint64_t blockedOnCalculatingDiagionalTimer_;
++};
++
++class OrderedContainer {
++ public:
++  OrderedContainer(
++      uint64_t totalRecords,
++      std::vector<std::shared_ptr<SpillableRowContainer>>&& containers,
++      std::vector<uint64_t>&& indexes);
++  // this vector should maintain the following invariant:
++  // max(sorted_containers_[i]) <= min(sorted_containers_[i + 1])
++  std::vector<std::shared_ptr<SpillableRowContainer>> sortedContainers_;
++  // represents the absolute index of the first record in the sorted_containers_
++  // vector
++  std::vector<uint64_t> indexes_;
++  std::uint64_t totalRecords_{0};
++
++  // accepts an absolute index across all the internal containers.
++  // returns a pair of indexes representing (1) The index of the sorted
++  // container in the internal sorted_containers_ list. And (2) The index within
++  // the container itself.
++  static std::pair<uint64_t, uint64_t> getContainerIdx(
++      uint64_t idx,
++      const std::vector<uint64_t>& indexes);
++  std::pair<uint64_t, uint64_t> getContainerIdx(uint64_t idx) const;
++  static std::shared_ptr<OrderedContainer> newContainer(
++      std::shared_ptr<SpillableRowContainer> container);
++  // Flattens multiple ordered containers into a single ordered container.
++  static std::shared_ptr<OrderedContainer> merge(
++      const std::vector<std::shared_ptr<OrderedContainer>>& containers);
++  std::string toString() const;
++};
++
++struct ArrayPartition {
++  uint64_t minIdx; // inclusive
++  uint64_t maxIdx; // exclusive
++
++  std::string toString() {
++    return fmt::format("[minIdx={}, maxIdx={}]", minIdx, maxIdx);
++  }
++};
++
++class SortWork {
++ public:
++  std::shared_ptr<OrderedContainer> a;
++  std::shared_ptr<OrderedContainer> b;
++  ArrayPartition aPart;
++  ArrayPartition bPart;
++  const SortBufferMergePath* op;
++  SortWork(
++      std::shared_ptr<OrderedContainer> a,
++      std::shared_ptr<OrderedContainer> b,
++      ArrayPartition aPart,
++      ArrayPartition bPart,
++      const SortBufferMergePath* op)
++      : a(std::move(a)), b(std::move(b)), aPart(aPart), bPart(bPart), op(op) {}
++
++  std::string toString() {
++    return fmt::format(
++        "SortWork(a={}, b={}, aPart={}, bPart={})",
++        a->totalRecords_,
++        b->totalRecords_,
++        aPart.toString(),
++        bPart.toString());
++  }
++
++  std::shared_ptr<OrderedContainer> merge();
++};
++
++} // namespace bytedance::bolt::exec
+diff --git a/bolt/exec/tests/CMakeLists.txt b/bolt/exec/tests/CMakeLists.txt
+index d9a578ee39..b231809a7c 100644
+--- a/bolt/exec/tests/CMakeLists.txt
++++ b/bolt/exec/tests/CMakeLists.txt
+@@ -73,6 +73,7 @@ add_executable(
+   OneWayStatusFlagTest.cpp
+   OperatorTraceTest.cpp
+   OrderByTest.cpp
++  OrderByRowContainerTest.cpp
+   OutputBufferManagerTest.cpp
+   PlanNodeSerdeTest.cpp
+   PlanNodeToStringTest.cpp
+@@ -85,6 +86,7 @@ add_executable(
+   SortAlgoTest.cpp
+   SortAndWindowTest.cpp
+   SortBufferTest.cpp
++  SortBufferMergePathTest.cpp
+   SortWindowTest.cpp
+   SpillableWindowTest.cpp
+   SpillerTest.cpp
+diff --git a/bolt/exec/tests/OrderByRowContainerTest.cpp b/bolt/exec/tests/OrderByRowContainerTest.cpp
+new file mode 100644
+index 0000000000..cf416ab151
+--- /dev/null
++++ b/bolt/exec/tests/OrderByRowContainerTest.cpp
+@@ -0,0 +1,252 @@
++/*
++ * Copyright (c) Facebook, Inc. and its affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "bolt/exec/OrderByRowContainer.h"
++#include "bolt/exec/tests/utils/OperatorTestBase.h"
++#include "bolt/exec/tests/utils/PlanBuilder.h"
++#include "bolt/vector/tests/utils/VectorTestBase.h"
++
++using namespace bytedance::bolt;
++using namespace bytedance::bolt::exec;
++using namespace bytedance::bolt::exec::test;
++
++class OrderByRowContainerTest : public OperatorTestBase {
++ public:
++  void TearDown() override {
++    OperatorTestBase::TearDown();
++    container_.reset();
++    pool_.reset();
++  }
++
++  void SetUp() override {
++    OperatorTestBase::SetUp();
++    pool_.reset();
++    container_.reset();
++    pool_ = memory::memoryManager()->addLeafPool();
++
++    rowType_ = ROW({{"c0", INTEGER()}, {"c1", VARCHAR()}});
++
++    sortColumnIndices_ = {0}; // Sort by first column (c0)
++    sortCompareFlags_ = {CompareFlags{true, true}}; // ASC, NULLS FIRST
++
++    spillConfig_ = {
++
++    };
++    container_ = std::make_unique<OrderByRowContainer>(
++        sortColumnIndices_,
++        sortCompareFlags_,
++        rowType_,
++        pool_.get(),
++        nullptr,
++        1024);
++  }
++
++  RowVectorPtr createTestData(int numRows) {
++    std::vector<int32_t> c0Values;
++    VectorFuzzer::Options opts;
++    opts.vectorSize = numRows;
++    opts.nullRatio = 0;
++    VectorFuzzer fuzzer(opts, pool(), 0);
++    return fuzzer.fuzzRow(ROW({INTEGER(), VARCHAR()}));
++  }
++
++  static void assertEqualVectorPart(
++      const VectorPtr& expected,
++      const VectorPtr& actual) {
++    ASSERT_GE(expected->size(), actual->size());
++    ASSERT_EQ(expected->typeKind(), actual->typeKind());
++    for (vector_size_t i = 0; i < actual->size(); i++) {
++      ASSERT_TRUE(expected->equalValueAt(actual.get(), i, i))
++          << "at " << (i) << ": expected " << expected->toString(i)
++          << ", but got " << actual->toString(i);
++    }
++  }
++
++  void assertPinnedEqual(
++      const std::shared_ptr<PinnedRowContainer>& pinnedContainer,
++      const RowVectorPtr& expected) {
++    auto rc = pinnedContainer->getRowContainer();
++    // verify the data is equal
++    auto& rows = pinnedContainer->getRows();
++    auto rowCount = rows.size();
++    for (int i = 0; i < expected->childrenSize(); i++) {
++      auto expectedColumn = expected->childAt(i);
++      auto actualColumn =
++          BaseVector::create(expectedColumn->type(), rowCount, pool_.get());
++      rc->extractColumn(
++          rows.data(), rowCount, rc->columnAt(i), 0, actualColumn, true);
++      assertEqualVectorPart(expectedColumn, actualColumn);
++    }
++  }
++
++  RowTypePtr rowType_;
++  std::vector<column_index_t> sortColumnIndices_;
++  std::vector<CompareFlags> sortCompareFlags_;
++  std::shared_ptr<memory::MemoryPool> pool_;
++  common::SpillConfig spillConfig_;
++  std::unique_ptr<OrderByRowContainer> container_;
++};
++
++TEST_F(OrderByRowContainerTest, PinWriteUnpin) {
++  auto testData = createTestData(5);
++  auto spillableContainer = container_->addVector(testData);
++  auto pinnedContainer = spillableContainer->pin();
++  auto rowContainer = pinnedContainer->getRowContainer();
++  assertPinnedEqual(pinnedContainer, testData);
++}
++
++// Disabled until OrderByRowContainer supports spilling again.
++TEST_F(OrderByRowContainerTest, DISABLED_WriteEvictRepin) {
++  auto testData = createTestData(10);
++  auto spillingContainer = container_->addVector(testData);
++
++  {
++    auto pinnedContainer = spillingContainer->pin();
++    assertPinnedEqual(pinnedContainer, testData);
++  }
++
++  {
++    auto largeData = createTestData(100); // Large enough to trigger eviction
++    ASSERT_EQ(container_->evictions(), 0);
++    auto largeContainer = container_->addVector(largeData);
++    auto largePinned = largeContainer->pin();
++    ASSERT_GT(container_->evictions(), 0);
++    assertPinnedEqual(largePinned, largeData);
++  }
++
++  auto repinnedContainer = spillingContainer->pin();
++  assertPinnedEqual(repinnedContainer, testData);
++}
++
++TEST_F(OrderByRowContainerTest, DoublePin) {
++  auto testData = createTestData(200);
++
++  auto spillingContainer = container_->addVector(testData);
++  auto pin1 = spillingContainer->pin();
++  auto pin2 = spillingContainer->pin();
++  ASSERT_EQ(pin1->getRowContainer(), pin2->getRowContainer());
++}
++
++// Create and pin a large number of containers to trigger lots of eviction
++// Disabled until we can support spilling
++TEST_F(OrderByRowContainerTest, DISABLED_ManyPins) {
++  auto containerCount = 256;
++  std::vector<std::shared_ptr<SpillableRowContainer>> containers;
++  std::vector<RowVectorPtr> testData;
++  for (int i = 0; i < containerCount; i++) {
++    testData.push_back(createTestData(5));
++    containers.push_back(container_->addVector(testData[i]));
++  }
++  BOLT_CHECK_GT(container_->evictions(), 0);
++  for (int i = 0; i < containerCount; i++) {
++    auto pin = containers[i]->pin();
++    assertPinnedEqual(pin, testData[i]);
++  }
++  // one eviction per container on creation, and then once per pin() call
++  // -2 because 2 containers fit without spilling
++  BOLT_CHECK_EQ(container_->evictions(), (containerCount * 2) - 2);
++}
++
++TEST_F(OrderByRowContainerTest, projectionMapping) {
++  // (BIGINT a, BIGINT b, DOUBLE c) with sort key on a (index 0)
++  // Expected: [0, 1, 2]
++  {
++    auto inputType = ROW({{"a", BIGINT()}, {"b", BIGINT()}, {"c", DOUBLE()}});
++    std::vector<column_index_t> sortIndices = {0};
++    std::vector<CompareFlags> sortFlags = {
++        CompareFlags{.nullsFirst = true, .ascending = true}};
++
++    auto container = std::make_unique<OrderByRowContainer>(
++        sortIndices, sortFlags, inputType, pool_.get(), nullptr, 1024);
++
++    const auto& projectionMapping = container->projectionMapping();
++    ASSERT_EQ(projectionMapping.size(), 3);
++    ASSERT_EQ(projectionMapping[0], 0); // a (sorted)
++    ASSERT_EQ(projectionMapping[1], 1); // b (non-sorted)
++    ASSERT_EQ(projectionMapping[2], 2); // c (non-sorted)
++  }
++
++  // (BIGINT a, BIGINT b, DOUBLE c) with sort key on c (index 2)
++  // Expected: [2, 0, 1]
++  {
++    auto inputType = ROW({{"a", BIGINT()}, {"b", BIGINT()}, {"c", DOUBLE()}});
++    std::vector<column_index_t> sortIndices = {2};
++    std::vector<CompareFlags> sortFlags = {CompareFlags{true, true}};
++
++    auto container = std::make_unique<OrderByRowContainer>(
++        sortIndices, sortFlags, inputType, pool_.get(), nullptr, 1024);
++
++    const auto& projectionMapping = container->projectionMapping();
++    ASSERT_EQ(projectionMapping.size(), 3);
++    ASSERT_EQ(projectionMapping[0], 2); // c (sorted)
++    ASSERT_EQ(projectionMapping[1], 0); // a (non-sorted)
++    ASSERT_EQ(projectionMapping[2], 1); // b (non-sorted)
++  }
++
++  // (BIGINT a, BIGINT b, DOUBLE c) with sort keys on b and c (indices 1 and 2)
++  // Expected: [1, 2, 0]
++  {
++    auto inputType = ROW({{"a", BIGINT()}, {"b", BIGINT()}, {"c", DOUBLE()}});
++    std::vector<column_index_t> sortIndices = {1, 2};
++    std::vector<CompareFlags> sortFlags = {
++        CompareFlags{true, true}, CompareFlags{true, true}};
++
++    auto container = std::make_unique<OrderByRowContainer>(
++        sortIndices, sortFlags, inputType, pool_.get(), nullptr, 1024);
++
++    const auto& projectionMapping = container->projectionMapping();
++    ASSERT_EQ(projectionMapping.size(), 3);
++    ASSERT_EQ(projectionMapping[0], 1); // b (sorted first)
++    ASSERT_EQ(projectionMapping[1], 2); // c (sorted second)
++    ASSERT_EQ(projectionMapping[2], 0); // a (non-sorted)
++  }
++
++  // (BIGINT a, BIGINT b, DOUBLE c) with sort keys on a and b
++  // Expected: [0, 1, 2]
++  {
++    auto inputType = ROW({{"a", BIGINT()}, {"b", BIGINT()}, {"c", DOUBLE()}});
++    std::vector<column_index_t> sortIndices = {0, 1};
++    std::vector<CompareFlags> sortFlags = {
++        CompareFlags{true, true}, CompareFlags{true, true}};
++
++    auto container = std::make_unique<OrderByRowContainer>(
++        sortIndices, sortFlags, inputType, pool_.get(), nullptr, 1024);
++
++    const auto& projectionMapping = container->projectionMapping();
++    ASSERT_EQ(projectionMapping.size(), 3);
++    ASSERT_EQ(projectionMapping[0], 0); // a (sorted first)
++    ASSERT_EQ(projectionMapping[1], 1); // b (sorted second)
++    ASSERT_EQ(projectionMapping[2], 2); // c (non-sorted)
++  }
++
++  // (BIGINT a, BIGINT b, DOUBLE c) with sort keys on a and c
++  // Expected: [0, 2, 1]
++  {
++    auto inputType = ROW({{"a", BIGINT()}, {"b", BIGINT()}, {"c", DOUBLE()}});
++    std::vector<column_index_t> sortIndices = {0, 2};
++    std::vector<CompareFlags> sortFlags = {
++        CompareFlags{true, true}, CompareFlags{true, true}};
++
++    auto container = std::make_unique<OrderByRowContainer>(
++        sortIndices, sortFlags, inputType, pool_.get(), nullptr, 1024);
++
++    const auto& projectionMapping = container->projectionMapping();
++    ASSERT_EQ(projectionMapping.size(), 3);
++    ASSERT_EQ(projectionMapping[0], 0); // b (sorted first)
++    ASSERT_EQ(projectionMapping[1], 2); // c (sorted second)
++    ASSERT_EQ(projectionMapping[2], 1); // a (non-sorted)
++  }
++}
+\ No newline at end of file
+diff --git a/bolt/exec/tests/OrderByTest.cpp b/bolt/exec/tests/OrderByTest.cpp
+index 5facb7acfb..2877821d3b 100644
+--- a/bolt/exec/tests/OrderByTest.cpp
++++ b/bolt/exec/tests/OrderByTest.cpp
+@@ -283,9 +283,22 @@ class OrderByTest : public OperatorTestBase, public WithGPUParamInterface<> {
+       const core::PlanNodeId& orderById,
+       const std::string& duckDbSql,
+       const std::vector<uint32_t>& sortingKeys) {
+-    {
+-      SCOPED_TRACE("run without spilling");
+-      assertQueryOrdered(planNode, duckDbSql, sortingKeys);
++    for (bool useMergePath : {true, false}) {
++      auto queryCtx = std::make_shared<core::QueryCtx>(executor_.get());
++      {
++        SCOPED_TRACE(
++            "run without spilling, with mergepath: " + useMergePath ? "true"
++                                                                    : "false");
++        queryCtx->testingOverrideConfigUnsafe({
++            {core::QueryConfig::kOrderByMergePathEnabled,
++             useMergePath ? "true" : "false"},
++            {QueryConfig::kJitLevel, "-1"},
++        });
++        CursorParameters params;
++        params.planNode = planNode;
++        params.queryCtx = queryCtx;
++        assertQueryOrdered(params, duckDbSql, sortingKeys);
++      }
+     }
+     if (GetParam().useGPU) {
+       // Exiting function. The current GPU operators lack support for spilling.
+@@ -2054,10 +2067,58 @@ TEST_P(OrderByTest, maxSpillBytes) {
+   }
+ }
+ 
++DEBUG_ONLY_TEST_P(OrderByTest, reclaimFromOrderByMergePath) {
++  if (GetParam().useGPU) {
++    GTEST_SKIP() << "GPU OrderBy does not support spilling\n";
++  }
++  if (!FLAGS_bolt_testing_enable_arbitration) {
++    GTEST_SKIP() << "test requires using a real arbitrator\n";
++  }
++  std::vector<RowVectorPtr> vectors = createVectors(8, rowType_, fuzzerOpts_);
++  createDuckDbTable(vectors);
++
++  const auto spillDirectory = exec::test::TempDirectoryPath::create();
++  std::atomic_int numInputsMergePath{0};
++  core::PlanNodeId orderById;
++  SCOPED_TESTVALUE_SET(
++      "bytedance::bolt::exec::Driver::runInternal::addInput",
++      std::function<void(Operator*)>(([&](Operator* op) {
++        if (op->operatorType() != "OrderBy") {
++          return;
++        }
++        if (++numInputsMergePath != 5) {
++          return;
++        }
++        auto* driver = op->testingOperatorCtx()->driver();
++        SuspendedSection suspendedSection(driver);
++        memory::testingRunArbitration();
++      })));
++  auto task =
++      AssertQueryBuilder(duckDbQueryRunner_)
++          .spillDirectory(spillDirectory->getPath())
++          .config(core::QueryConfig::kSpillEnabled, true)
++          .config(core::QueryConfig::kOrderBySpillEnabled, true)
++          .config(core::QueryConfig::kOrderByMergePathEnabled, true)
++          .plan(PlanBuilder()
++                    .values(vectors)
++                    .orderBy({"c0 ASC NULLS LAST"}, false)
++                    .capturePlanNodeId(orderById)
++                    .planNode())
++          .assertResults("SELECT * FROM tmp ORDER BY c0 ASC NULLS LAST");
++  auto taskStats = exec::toPlanStats(task->taskStats());
++  auto& planStats = taskStats.at(orderById);
++  ASSERT_GT(planStats.spilledBytes, 0);
++  task.reset();
++  waitForAllTasksToBeDeleted();
++}
++
+ DEBUG_ONLY_TEST_P(OrderByTest, reclaimFromOrderBy) {
+   if (GetParam().useGPU) {
+     GTEST_SKIP() << "GPU OrderBy does not support spilling\n";
+   }
++  if (!FLAGS_bolt_testing_enable_arbitration) {
++    GTEST_SKIP() << "test requires using a real arbitrator\n";
++  }
+ 
+   std::vector<RowVectorPtr> vectors = createVectors(8, rowType_, fuzzerOpts_);
+   createDuckDbTable(vectors);
+diff --git a/bolt/exec/tests/SortBufferMergePathTest.cpp b/bolt/exec/tests/SortBufferMergePathTest.cpp
+new file mode 100644
+index 0000000000..0929fba2d9
+--- /dev/null
++++ b/bolt/exec/tests/SortBufferMergePathTest.cpp
+@@ -0,0 +1,1191 @@
++/*
++ * Copyright (c) Facebook, Inc. and its affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <gtest/gtest.h>
++
++#include "bolt/common/file/FileSystems.h"
++#include "bolt/exec/SortBuffer.h"
++#include "bolt/exec/SortBufferMergePath.h"
++#include "bolt/exec/tests/utils/OperatorTestBase.h"
++#include "bolt/exec/tests/utils/TempDirectoryPath.h"
++#include "bolt/type/Type.h"
++#include "bolt/vector/fuzzer/VectorFuzzer.h"
++#include "bolt/vector/tests/utils/VectorTestBase.h"
++
++using namespace bytedance::bolt::exec;
++using namespace bytedance::bolt::exec::test;
++using namespace bytedance::bolt;
++using namespace bytedance::bolt::memory;
++
++namespace bytedance::bolt::functions::test {
++
++class SortBufferMergePathTest : public OperatorTestBase {
++ protected:
++  void SetUp() override {
++    filesystems::registerLocalFileSystem();
++    if (!isRegisteredVectorSerde()) {
++      this->registerVectorSerde();
++    }
++    rng_.seed(123);
++  }
++
++  common::SpillConfig getSpillConfig(const std::string& spillDir) const {
++    return common::SpillConfig(
++        [&]() -> const std::string& { return spillDir; },
++        [&](uint64_t) {},
++        "0.0.0",
++        0,
++        false,
++        0,
++        executor_.get(),
++        5,
++        10,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        "none");
++  }
++
++  RowVectorPtr createSizedRowVector(int length) {
++    std::vector<int64_t> c0(length);
++    std::vector<int32_t> c1(length);
++    std::vector<int16_t> c2(length);
++    std::vector<float> c3(length);
++    std::vector<double> c4(length);
++    std::vector<std::string> c5(length);
++    for (int i = 0; i < length; i++) {
++      c0[i] = i;
++      c1[i] = i;
++      c2[i] = i;
++      c3[i] = i;
++      c4[i] = i;
++      c5[i] = std::to_string(i);
++    }
++    return makeRowVector(
++        {makeFlatVector<int64_t>(c0),
++         makeFlatVector<int32_t>(c1), // sorted column
++         makeFlatVector<int16_t>(c2),
++         makeFlatVector<float>(c3),
++         makeFlatVector<double>(c4),
++         makeFlatVector<std::string>(c5)});
++  }
++
++  const RowTypePtr inputType_ = ROW(
++      {{"c0", BIGINT()},
++       {"c1", INTEGER()},
++       {"c2", SMALLINT()},
++       {"c3", REAL()},
++       {"c4", DOUBLE()},
++       {"c5", VARCHAR()}});
++  // Specifies the sort columns ["c4", "c1"].
++  std::vector<column_index_t> sortColumnIndices_{4, 1};
++  std::vector<CompareFlags> sortCompareFlags_{
++      {true, true, false, CompareFlags::NullHandlingMode::kNullAsValue},
++      {true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}};
++
++  const int64_t maxBytes_ = 1 << 30; // 1GB;
++  const std::shared_ptr<memory::MemoryPool> rootPool_{
++      memory::memoryManager()->addRootPool(
++          "SortBufferMergePathTest",
++          maxBytes_)};
++  const std::shared_ptr<memory::MemoryPool> pool_{
++      rootPool_->addLeafChild("SortBufferMergePathTest", maxBytes_)};
++  const std::shared_ptr<folly::Executor> executor_{
++      std::make_shared<folly::CPUThreadPoolExecutor>(
++          std::thread::hardware_concurrency())};
++  folly::Random::DefaultGenerator rng_;
++  tsan_atomic<bool> nonReclaimableSection_{false};
++};
++
++TEST_F(SortBufferMergePathTest, testGetContainerIdx) {
++  std::vector<uint64_t> indexes = {0, 10, 20, 30, 31, 50};
++  struct TestCase {
++    uint64_t inputIdx;
++    uint64_t outputContainerIdx;
++    uint64_t outputRelativeIdx;
++  } testCases[] = {
++      {0, 0, 0},
++      {1, 0, 1},
++      {9, 0, 9},
++      {10, 1, 0},
++      {15, 1, 5},
++      {19, 1, 9},
++      {20, 2, 0},
++      {25, 2, 5},
++      {30, 3, 0},
++      {31, 4, 0},
++      {50, 5, 0},
++      {51, 5, 1},
++      {55, 5, 5},
++  };
++  for (const auto& testCase : testCases) {
++    auto containerIdx =
++        OrderedContainer::getContainerIdx(testCase.inputIdx, indexes);
++    ASSERT_EQ(containerIdx.first, testCase.outputContainerIdx);
++    ASSERT_EQ(containerIdx.second, testCase.outputRelativeIdx);
++  }
++}
++
++// Tests sorting with a single vector input that have multiple columns and a
++// single-column sort key
++TEST_F(SortBufferMergePathTest, singleKey) {
++  struct {
++    std::vector<CompareFlags> sortCompareFlags;
++    std::vector<int32_t> expectedResult;
++
++    std::string debugString() const {
++      const std::string expectedResultStr = folly::join(",", expectedResult);
++      std::stringstream sortCompareFlagsStr;
++      for (const auto sortCompareFlag : sortCompareFlags) {
++        sortCompareFlagsStr << sortCompareFlag.toString();
++      }
++      return fmt::format(
++          "sortCompareFlags:{}, expectedResult:{}",
++          sortCompareFlagsStr.str(),
++          expectedResultStr);
++    }
++  } testSettings[] = {
++      {{{true,
++         true,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // Ascending
++       {0, 1, 2, 3, 4}},
++      {{{true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // Descending
++       {4, 3, 2, 1, 0}}};
++
++  sortColumnIndices_ = {1};
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kJitLevel, "0"}};
++  auto queryConfig = core::QueryConfig({configs});
++  for (const auto& testData : testSettings) {
++    SCOPED_TRACE(testData.debugString());
++    auto sortBuffer = std::make_unique<SortBufferMergePath>(
++        inputType_,
++        sortColumnIndices_,
++        testData.sortCompareFlags,
++        pool_.get(),
++        &nonReclaimableSection_,
++        &queryConfig,
++        nullptr,
++        nullptr,
++        executor_);
++
++    RowVectorPtr data = createSizedRowVector(5);
++
++    sortBuffer->addInput(data);
++    sortBuffer->noMoreInput();
++    auto output = sortBuffer->getOutput(10000);
++    ASSERT_EQ(output->size(), 5);
++    int resultIndex = 0;
++    for (int expectedValue : testData.expectedResult) {
++      ASSERT_EQ(
++          output->childAt(1)->asFlatVector<int32_t>()->valueAt(resultIndex++),
++          expectedValue);
++    }
++  }
++}
++
++// Tests sorting with a single vector input that have varchar column as a single
++// sort key
++TEST_F(SortBufferMergePathTest, singleKeyMultiVecVarchar) {
++  struct {
++    std::vector<CompareFlags> sortCompareFlags;
++    std::vector<std::string> expectedResult;
++
++    std::string debugString() const {
++      const std::string expectedResultStr = folly::join(",", expectedResult);
++      std::stringstream sortCompareFlagsStr;
++      for (const auto sortCompareFlag : sortCompareFlags) {
++        sortCompareFlagsStr << sortCompareFlag.toString();
++      }
++      return fmt::format(
++          "sortCompareFlags:{}, expectedResult:{}",
++          sortCompareFlagsStr.str(),
++          expectedResultStr);
++    }
++  } testSettings[] = {
++      {{{true,
++         true,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // Ascending
++       {"0", "1", "2", "3", "4"}},
++      {{{true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // Descending
++       {"4", "3", "2", "1", "0"}}};
++
++  sortColumnIndices_ = {5};
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kJitLevel, "0"}};
++  auto queryConfig = core::QueryConfig({configs});
++  for (const auto& testData : testSettings) {
++    SCOPED_TRACE(testData.debugString());
++    auto sortBuffer = std::make_unique<SortBufferMergePath>(
++        inputType_,
++        sortColumnIndices_,
++        testData.sortCompareFlags,
++        pool_.get(),
++        &nonReclaimableSection_,
++        &queryConfig,
++        nullptr,
++        nullptr,
++        executor_);
++
++    // Create single-character alphabetic vectors, each with one element
++    RowVectorPtr data = createSizedRowVector(5);
++    for (int i = 0; i < 5; i++) {
++      sortBuffer->addInput(data->slice(i, 1));
++    }
++
++    sortBuffer->noMoreInput();
++    VectorPtr baseOut = BaseVector::create(inputType_, 0, pool_.get());
++    auto output = baseOut->as<RowVector>();
++    while (auto out = sortBuffer->getOutput(10000)) {
++      output->append(out.get());
++    }
++    ASSERT_EQ(output->size(), 5);
++    int resultIndex = 0;
++    for (const auto& expectedValue : testData.expectedResult) {
++      ASSERT_EQ(
++          output->childAt(5)
++              ->asFlatVector<StringView>()
++              ->valueAt(resultIndex++)
++              .str(),
++          expectedValue);
++    }
++  }
++}
++
++TEST_F(SortBufferMergePathTest, singleKeyTwoVec) {
++  struct {
++    std::vector<CompareFlags> sortCompareFlags;
++    std::vector<int32_t> expectedResult;
++
++    std::string debugString() const {
++      const std::string expectedResultStr = folly::join(",", expectedResult);
++      std::stringstream sortCompareFlagsStr;
++      for (const auto sortCompareFlag : sortCompareFlags) {
++        sortCompareFlagsStr << sortCompareFlag.toString();
++      }
++      return fmt::format(
++          "sortCompareFlags:{}, expectedResult:{}",
++          sortCompareFlagsStr.str(),
++          expectedResultStr);
++    }
++  } testSettings[] = {
++      {{{true,
++         true,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // Ascending
++       {0, 0, 1, 1, 2, 2, 3, 3, 4, 4}},
++      {{{true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // Descending
++       {4, 4, 3, 3, 2, 2, 1, 1, 0, 0}}};
++
++  sortColumnIndices_ = {1};
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kJitLevel, "0"}};
++  auto queryConfig = core::QueryConfig({configs});
++  for (const auto& testData : testSettings) {
++    SCOPED_TRACE(testData.debugString());
++    auto sortBuffer = std::make_unique<SortBufferMergePath>(
++        inputType_,
++        sortColumnIndices_,
++        testData.sortCompareFlags,
++        pool_.get(),
++        &nonReclaimableSection_,
++        &queryConfig,
++        nullptr,
++        nullptr,
++        executor_);
++
++    RowVectorPtr data = createSizedRowVector(5);
++    sortBuffer->addInput(data);
++    sortBuffer->addInput(data);
++    sortBuffer->noMoreInput();
++    VectorPtr baseOut = BaseVector::create(inputType_, 0, pool_.get());
++    auto output = baseOut->as<RowVector>();
++    while (auto out = sortBuffer->getOutput(10000)) {
++      output->append(out.get());
++    }
++    ASSERT_EQ(output->size(), 10);
++    int resultIndex = 0;
++    for (int expectedValue : testData.expectedResult) {
++      ASSERT_EQ(
++          output->as<RowVector>()->childAt(1)->asFlatVector<int32_t>()->valueAt(
++              resultIndex++),
++          expectedValue);
++    }
++  }
++}
++
++TEST_F(SortBufferMergePathTest, singleKeyTwoVecWithJit) {
++  struct {
++    std::vector<CompareFlags> sortCompareFlags;
++    std::vector<int32_t> expectedResult;
++
++    std::string debugString() const {
++      const std::string expectedResultStr = folly::join(",", expectedResult);
++      std::stringstream sortCompareFlagsStr;
++      for (const auto sortCompareFlag : sortCompareFlags) {
++        sortCompareFlagsStr << sortCompareFlag.toString();
++      }
++      return fmt::format(
++          "sortCompareFlags:{}, expectedResult:{}",
++          sortCompareFlagsStr.str(),
++          expectedResultStr);
++    }
++  } testSettings[] = {
++      {{{true,
++         true,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // Ascending
++       {0, 0, 1, 1, 2, 2, 3, 3, 4, 4}},
++      {{{true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // Descending
++       {4, 4, 3, 3, 2, 2, 1, 1, 0, 0}}};
++
++  sortColumnIndices_ = {1};
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kJitLevel, "-1"}};
++  auto queryConfig = core::QueryConfig({configs});
++  for (const auto& testData : testSettings) {
++    SCOPED_TRACE(testData.debugString());
++    auto sortBuffer = std::make_unique<SortBufferMergePath>(
++        inputType_,
++        sortColumnIndices_,
++        testData.sortCompareFlags,
++        pool_.get(),
++        &nonReclaimableSection_,
++        &queryConfig,
++        nullptr,
++        nullptr,
++        executor_);
++
++    RowVectorPtr data = createSizedRowVector(5);
++    sortBuffer->addInput(data);
++    sortBuffer->addInput(data);
++    sortBuffer->noMoreInput();
++    VectorPtr baseOut = BaseVector::create(inputType_, 0, pool_.get());
++    auto output = baseOut->as<RowVector>();
++    while (auto out = sortBuffer->getOutput(10000)) {
++      output->append(out.get());
++    }
++    ASSERT_EQ(output->size(), 10);
++    int resultIndex = 0;
++    for (int expectedValue : testData.expectedResult) {
++      ASSERT_EQ(
++          output->as<RowVector>()->childAt(1)->asFlatVector<int32_t>()->valueAt(
++              resultIndex++),
++          expectedValue);
++    }
++  }
++}
++
++// Tests sorting with multiple input vectors that have multiple columns and a
++// single-column sort key
++TEST_F(SortBufferMergePathTest, singleKeyMultiVec) {
++  int vectors = 128;
++  int vectorLength = 4096;
++  std::vector<int32_t> expectedResultsAsc(vectorLength * vectors);
++  std::vector<int32_t> expectedResultsDesc(vectorLength * vectors);
++  for (int i = 0; i < vectorLength; i++) {
++    for (int j = 0; j < vectors; j++) {
++      expectedResultsAsc[(i * vectors) + j] = i;
++      expectedResultsDesc[(i * vectors) + j] = vectorLength - (i + 1);
++    }
++  }
++  RowVectorPtr input = createSizedRowVector(vectorLength);
++
++  struct {
++    std::vector<CompareFlags> sortCompareFlags;
++    std::vector<int32_t> expectedResult;
++
++    std::string debugString() const {
++      const std::string expectedResultStr = folly::join(",", expectedResult);
++      std::stringstream sortCompareFlagsStr;
++      for (const auto sortCompareFlag : sortCompareFlags) {
++        sortCompareFlagsStr << sortCompareFlag.toString();
++      }
++      return fmt::format(
++          "sortCompareFlags:{}, expectedResult[0]:{}",
++          sortCompareFlagsStr.str(),
++          expectedResult[0]);
++    }
++  } testSettings[] = {
++      {{{true,
++         true,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // Ascending
++       expectedResultsAsc},
++      {{{true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // Descending
++       expectedResultsDesc}};
++
++  sortColumnIndices_ = {1};
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kJitLevel, "0"}};
++  auto queryConfig = core::QueryConfig({configs});
++  for (const auto& testData : testSettings) {
++    SCOPED_TRACE(testData.debugString());
++    auto sortBuffer = std::make_unique<SortBufferMergePath>(
++        inputType_,
++        sortColumnIndices_,
++        testData.sortCompareFlags,
++        pool_.get(),
++        &nonReclaimableSection_,
++        &queryConfig,
++        nullptr,
++        nullptr,
++        executor_);
++
++    for (int i = 0; i < vectors; i++) {
++      sortBuffer->addInput(input);
++    }
++
++    sortBuffer->noMoreInput();
++    auto baseResult = BaseVector::create(inputType_, 0, pool_.get());
++    auto* result = baseResult->as<RowVector>();
++    while (auto output = sortBuffer->getOutput(10000)) {
++      result->append(output.get());
++    }
++
++    ASSERT_EQ(result->size(), vectors * vectorLength);
++    int resultIndex = 0;
++
++    auto resultVec = result->childAt(1)->asFlatVector<int32_t>();
++    std::vector<int> resultValues(resultVec->size());
++    for (int i = 0; i < result->size(); i++) {
++      resultValues[i] = resultVec->valueAt(i);
++    }
++    for (int expectedValue : testData.expectedResult) {
++      BOLT_CHECK_EQ(
++          resultVec->valueAt(resultIndex),
++          expectedValue,
++          "result not equal at: " + std::to_string(resultIndex) +
++              "Expected:" + std::to_string(expectedValue) + " but got " +
++              std::to_string(
++                  result->childAt(1)->asFlatVector<int32_t>()->valueAt(
++                      resultIndex)));
++      resultIndex++;
++    }
++  }
++}
++
++// Tests sorting with multiple input vectors that have multiple columns and
++// multiple sort keys including varchar
++TEST_F(SortBufferMergePathTest, multipleKeysWithVarchar) {
++  const int numVectors = 10;
++  const int vectorLength = 100;
++
++  struct {
++    std::vector<CompareFlags> sortCompareFlags;
++    bool ascC1;
++    bool ascC5;
++
++    std::string debugString() const {
++      std::stringstream sortCompareFlagsStr;
++      for (const auto sortCompareFlag : sortCompareFlags) {
++        sortCompareFlagsStr << sortCompareFlag.toString();
++      }
++      return fmt::format("sortCompareFlags:{}", sortCompareFlagsStr.str());
++    }
++  } testSettings[] = {
++      // Ascending on c1 (integer), ascending on c5 (varchar)
++      {{{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}, // c1
++        {true,
++         true,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // c5
++       true,
++       true},
++      // Descending on c1 (integer), ascending on c5 (varchar)
++      {{{true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}, // c1
++        {true,
++         true,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // c5
++       false,
++       true},
++      // Ascending on c1 (integer), descending on c5 (varchar)
++      {{{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}, // c1
++        {true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // c5
++       true,
++       false},
++      // Descending on c1 (integer), descending on c5 (varchar)
++      {{{true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}, // c1
++        {true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // c5
++       false,
++       false}};
++
++  // Specifies the sort columns ["c1", "c5"].
++  sortColumnIndices_ = {1, 5};
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kJitLevel, "0"}};
++  auto queryConfig = core::QueryConfig({configs});
++  for (const auto& testData : testSettings) {
++    SCOPED_TRACE(testData.debugString());
++    auto sortBuffer = std::make_unique<SortBufferMergePath>(
++        inputType_,
++        sortColumnIndices_,
++        testData.sortCompareFlags,
++        pool_.get(),
++        &nonReclaimableSection_,
++        &queryConfig,
++        nullptr,
++        nullptr,
++        executor_);
++
++    for (int i = 0; i < numVectors; ++i) {
++      sortBuffer->addInput(createSizedRowVector(vectorLength));
++    }
++
++    sortBuffer->noMoreInput();
++    auto result = BaseVector::create(inputType_, 0, pool_.get());
++    while (auto output = sortBuffer->getOutput(10000)) {
++      result->append(output.get());
++    }
++
++    ASSERT_EQ(result->size(), numVectors * vectorLength);
++    auto rowResult = result->as<RowVector>();
++
++    auto resultCol1 = rowResult->childAt(1)->asFlatVector<int32_t>();
++    auto resultCol5 = rowResult->childAt(5)->asFlatVector<StringView>();
++
++    for (int i = 0; i < result->size() - 1; ++i) {
++      int32_t val1_c1 = resultCol1->valueAt(i);
++      int32_t val2_c1 = resultCol1->valueAt(i + 1);
++      auto val1_c5 = resultCol5->valueAt(i);
++      auto val2_c5 = resultCol5->valueAt(i + 1);
++
++      if (testData.ascC1) {
++        ASSERT_LE(val1_c1, val2_c1);
++        if (val1_c1 == val2_c1) {
++          if (testData.ascC5) {
++            ASSERT_TRUE(val1_c5.compare(val2_c5) <= 0);
++          } else {
++            ASSERT_TRUE(val1_c5.compare(val2_c5) >= 0);
++          }
++        }
++      } else { // desc c1
++        ASSERT_GE(val1_c1, val2_c1);
++        if (val1_c1 == val2_c1) {
++          if (testData.ascC5) {
++            ASSERT_TRUE(val1_c5.compare(val2_c5) <= 0);
++          } else {
++            ASSERT_TRUE(val1_c5.compare(val2_c5) >= 0);
++          }
++        }
++      }
++    }
++  }
++}
++
++// Tests sorting with multiple numeric sort keys.
++TEST_F(SortBufferMergePathTest, multipleKeysNumeric) {
++  const int numVectors = 10;
++  const int vectorLength = 100;
++
++  struct {
++    std::vector<CompareFlags> sortCompareFlags;
++    bool ascC1;
++    bool ascC2;
++
++    std::string debugString() const {
++      std::stringstream sortCompareFlagsStr;
++      for (const auto sortCompareFlag : sortCompareFlags) {
++        sortCompareFlagsStr << sortCompareFlag.toString();
++      }
++      return fmt::format("sortCompareFlags:{}", sortCompareFlagsStr.str());
++    }
++  } testSettings[] = {
++      // Ascending on c1, ascending on c2
++      {{{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}, // c1
++        {true,
++         true,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // c2
++       true,
++       true},
++      // Descending on c1, ascending on c2
++      {{{true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}, // c1
++        {true,
++         true,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // c2
++       false,
++       true},
++      // Ascending on c1, descending on c2
++      {{{true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}, // c1
++        {true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // c2
++       true,
++       false},
++      // Descending on c1, descending on c2
++      {{{true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}, // c1
++        {true,
++         false,
++         false,
++         CompareFlags::NullHandlingMode::kNullAsValue}}, // c2
++       false,
++       false}};
++
++  // Specifies the sort columns ["c1", "c2"].
++  sortColumnIndices_ = {1, 2};
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kJitLevel, "0"}};
++  auto queryConfig = core::QueryConfig({configs});
++  for (const auto& testData : testSettings) {
++    SCOPED_TRACE(testData.debugString());
++    auto sortBuffer = std::make_unique<SortBufferMergePath>(
++        inputType_,
++        sortColumnIndices_,
++        testData.sortCompareFlags,
++        pool_.get(),
++        &nonReclaimableSection_,
++        &queryConfig,
++        nullptr,
++        nullptr,
++        executor_);
++
++    for (int i = 0; i < numVectors; ++i) {
++      sortBuffer->addInput(createSizedRowVector(vectorLength));
++    }
++
++    sortBuffer->noMoreInput();
++    auto result = BaseVector::create(inputType_, 0, pool_.get());
++    while (auto output = sortBuffer->getOutput(10000)) {
++      result->append(output.get());
++    }
++
++    ASSERT_EQ(result->size(), numVectors * vectorLength);
++    auto rowResult = result->as<RowVector>();
++
++    auto resultCol1 = rowResult->childAt(1)->asFlatVector<int32_t>();
++    auto resultCol2 = rowResult->childAt(2)->asFlatVector<int16_t>();
++
++    for (int i = 0; i < result->size() - 1; ++i) {
++      int32_t val1_c1 = resultCol1->valueAt(i);
++      int32_t val2_c1 = resultCol1->valueAt(i + 1);
++      int16_t val1_c2 = resultCol2->valueAt(i);
++      int16_t val2_c2 = resultCol2->valueAt(i + 1);
++
++      if (testData.ascC1) {
++        ASSERT_LE(val1_c1, val2_c1);
++        if (val1_c1 == val2_c1) {
++          if (testData.ascC2) {
++            ASSERT_LE(val1_c2, val2_c2);
++          } else {
++            ASSERT_GE(val1_c2, val2_c2);
++          }
++        }
++      } else { // desc c1
++        ASSERT_GE(val1_c1, val2_c1);
++        if (val1_c1 == val2_c1) {
++          if (testData.ascC2) {
++            ASSERT_LE(val1_c2, val2_c2);
++          } else {
++            ASSERT_GE(val1_c2, val2_c2);
++          }
++        }
++      }
++    }
++  }
++}
++
++TEST_F(SortBufferMergePathTest, multipleKeys) {
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kJitLevel, "0"}};
++  auto queryConfig = core::QueryConfig({configs});
++  auto sortBuffer = std::make_unique<SortBufferMergePath>(
++      inputType_,
++      sortColumnIndices_,
++      sortCompareFlags_,
++      pool_.get(),
++      &nonReclaimableSection_,
++      &queryConfig,
++      nullptr,
++      nullptr,
++      executor_);
++
++  RowVectorPtr data = makeRowVector(
++      {makeFlatVector<int64_t>({1, 2, 3, 4, 5}),
++       makeFlatVector<int32_t>({5, 4, 3, 2, 1}), // sorted-2 column
++       makeFlatVector<int16_t>({1, 2, 3, 4, 5}),
++       makeFlatVector<float>({1.1, 2.2, 3.3, 4.4, 5.5}),
++       makeFlatVector<double>({1.1, 2.2, 2.2, 5.5, 5.5}), // sorted-1 column
++       makeFlatVector<std::string>(
++           {"hello", "world", "today", "is", "great"})});
++
++  sortBuffer->addInput(data);
++  sortBuffer->noMoreInput();
++  auto output = sortBuffer->getOutput(10000);
++  ASSERT_EQ(output->size(), 5);
++  ASSERT_EQ(output->childAt(1)->asFlatVector<int32_t>()->valueAt(0), 5);
++  ASSERT_EQ(output->childAt(1)->asFlatVector<int32_t>()->valueAt(1), 3);
++  ASSERT_EQ(output->childAt(1)->asFlatVector<int32_t>()->valueAt(2), 4);
++  ASSERT_EQ(output->childAt(1)->asFlatVector<int32_t>()->valueAt(3), 1);
++  ASSERT_EQ(output->childAt(1)->asFlatVector<int32_t>()->valueAt(4), 2);
++}
++
++TEST_F(SortBufferMergePathTest, fallbackToSingleThread) {
++  // Specifies the sort columns ["c1"].
++  sortColumnIndices_ = {1, 2};
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kJitLevel, "0"}};
++  auto queryConfig = core::QueryConfig({configs});
++
++  // Create a SortBufferMergePath instance
++  auto sortBuffer = std::make_unique<SortBufferMergePath>(
++      inputType_,
++      sortColumnIndices_,
++      sortCompareFlags_,
++      pool_.get(),
++      &nonReclaimableSection_,
++      &queryConfig,
++      nullptr,
++      nullptr,
++      executor_);
++
++  // Add some input rows
++  const int numRows = 100;
++  RowVectorPtr data = createSizedRowVector(numRows);
++  sortBuffer->addInput(data);
++
++  // Add another batch of rows
++  RowVectorPtr data2 = createSizedRowVector(numRows);
++  sortBuffer->addInput(data2);
++
++  // Verify the total number of input rows
++  ASSERT_EQ(sortBuffer->numInputRows(), numRows * 2);
++
++  // Call fallbackToSingleThread and get the resulting buffer
++  auto singleThreadBuffer = sortBuffer->fallbackToSingleThread();
++
++  // Verify the returned buffer is not null
++  ASSERT_NE(singleThreadBuffer, nullptr);
++
++  // Verify the row container has the correct number of rows
++  ASSERT_EQ(singleThreadBuffer->numInputRows(), numRows * 2);
++
++  // Call noMoreInput on the single thread buffer
++  singleThreadBuffer->noMoreInput();
++
++  // Get the output and verify it has the correct number of rows
++  auto output = singleThreadBuffer->getOutput(numRows * 2);
++  ASSERT_NE(output, nullptr);
++  ASSERT_EQ(output->size(), numRows * 2);
++}
++
++TEST_F(SortBufferMergePathTest, batchOutput) {
++  struct {
++    bool triggerSpill;
++    std::vector<size_t> numInputRows;
++    size_t maxOutputRows;
++    std::vector<size_t> expectedOutputRowCount;
++
++    std::string debugString() const {
++      const std::string numInputRowsStr = folly::join(",", numInputRows);
++      const std::string expectedOutputRowCountStr =
++          folly::join(",", expectedOutputRowCount);
++      return fmt::format(
++          "triggerSpill:{}, numInputRows:{}, maxOutputRows:{}, expectedOutputRowCount:{}",
++          triggerSpill,
++          numInputRowsStr,
++          maxOutputRows,
++          expectedOutputRowCountStr);
++    }
++  } testSettings[] = {
++      {false, {2, 3, 3}, 1, {1, 1, 1, 1, 1, 1, 1, 1}},
++      {false, {2000, 2000}, 10000, {4000}},
++      {false, {2000, 2000}, 2000, {2000, 2000}},
++      {false, {1024, 1024, 1024}, 1000, {1000, 1000, 1000, 72}}};
++
++  TestScopedSpillInjection scopedSpillInjection(100);
++  auto queryConfig = core::QueryConfig({});
++  for (const auto& testData : testSettings) {
++    SCOPED_TRACE(testData.debugString());
++    auto spillDirectory = exec::test::TempDirectoryPath::create();
++    auto spillConfig = common::SpillConfig(
++        [&]() -> const std::string& { return spillDirectory->path; },
++        [&](uint64_t) {},
++        "0.0.0",
++        1000,
++        false,
++        0,
++        executor_.get(),
++        5,
++        10,
++        0,
++        0,
++        0,
++        0,
++        0,
++        100, //  testSpillPct
++        "none");
++    const std::shared_ptr<memory::MemoryPool> fuzzerPool =
++        memory::memoryManager()->addLeafPool("VectorFuzzer");
++    auto sortBuffer = std::make_unique<SortBufferMergePath>(
++        inputType_,
++        sortColumnIndices_,
++        sortCompareFlags_,
++        pool_.get(),
++        &nonReclaimableSection_,
++        &queryConfig,
++        nullptr,
++        nullptr,
++        executor_);
++
++    std::vector<RowVectorPtr> inputVectors;
++    inputVectors.reserve(testData.numInputRows.size());
++    uint64_t totalNumInput = 0;
++    for (size_t inputRows : testData.numInputRows) {
++      VectorFuzzer fuzzer({.vectorSize = inputRows}, fuzzerPool.get());
++      RowVectorPtr input = fuzzer.fuzzRow(inputType_);
++      sortBuffer->addInput(input);
++      inputVectors.push_back(input);
++      totalNumInput += inputRows;
++    }
++    sortBuffer->noMoreInput();
++    auto spillStats = sortBuffer->spilledStats();
++
++    int expectedOutputBufferIndex = 0;
++    RowVectorPtr output = sortBuffer->getOutput(testData.maxOutputRows);
++    while (output != nullptr) {
++      ASSERT_EQ(
++          output->size(),
++          testData.expectedOutputRowCount[expectedOutputBufferIndex++]);
++      output = sortBuffer->getOutput(testData.maxOutputRows);
++    }
++    inputVectors.clear();
++  }
++}
++
++TEST_F(SortBufferMergePathTest, sortShuffled) {
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kOrderByMergePathParallelism, "4"}};
++  auto queryConfig = core::QueryConfig(configs);
++  auto spillDirectory = exec::test::TempDirectoryPath::create();
++  auto spillConfig = common::SpillConfig(
++      [&]() -> const std::string& { return spillDirectory->path; },
++      [&](uint64_t) {},
++      "0.0.0",
++      1000,
++      false,
++      0,
++      executor_.get(),
++      5,
++      10,
++      0,
++      0,
++      0,
++      0,
++      0,
++      100, //  testSpillPct
++      "none");
++  const std::shared_ptr<memory::MemoryPool> fuzzerPool =
++      memory::memoryManager()->addLeafPool("VectorFuzzer");
++  auto type = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
++  std::vector<CompareFlags> sortCompareFlags = {
++      {true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}};
++  std::vector<column_index_t> sortIndx = {0};
++  auto sortBuffer = std::make_unique<SortBufferMergePath>(
++      type,
++      sortIndx,
++      sortCompareFlags,
++      pool_.get(),
++      &nonReclaimableSection_,
++      &queryConfig,
++      nullptr,
++      nullptr,
++      executor_);
++  auto exec = std::make_shared<folly::CPUThreadPoolExecutor>(
++      std::thread::hardware_concurrency());
++  const int numRows = 2'000'000;
++  // split row generation over multiple threads
++  std::vector<folly::Future<RowVectorPtr>> futures;
++  for (int i = 0; i < std::thread::hardware_concurrency(); i++) {
++    auto chunkSize = numRows / std::thread::hardware_concurrency();
++    auto chunkStart = i * chunkSize;
++    futures.push_back(folly::via(exec.get(), [this, chunkSize, chunkStart]() {
++      std::random_device rd;
++      std::mt19937 g(rd());
++      std::vector<uint64_t> c0(chunkSize);
++      std::vector<uint64_t> c1(chunkSize);
++      for (int j = 0; j < chunkSize; j++) {
++        c0[j] = chunkStart + j;
++      }
++      std::shuffle(c0.begin(), c0.end(), g);
++      for (int j = 0; j < chunkSize; j++) {
++        c1[j] = c0[j] % 7;
++      }
++
++      return makeRowVector(
++          {makeFlatVector<uint64_t>(c0), makeFlatVector<uint64_t>(c1)});
++    }));
++  }
++  auto inputVectors = folly::collectAll(futures).get();
++  std::random_device rd;
++  std::mt19937 g(rd());
++  std::shuffle(inputVectors.begin(), inputVectors.end(), g);
++  for (auto inputVec : inputVectors) {
++    sortBuffer->addInput(inputVec.value());
++  }
++  sortBuffer->noMoreInput();
++  auto baseResult = BaseVector::create(type, 0, pool_.get());
++  auto* result = baseResult->as<RowVector>();
++  while (true) {
++    auto outputVec = sortBuffer->getOutput(10 << 10);
++    if (outputVec == nullptr) {
++      break;
++    }
++    result->append(outputVec.get());
++  }
++  ASSERT_EQ(result->size(), numRows);
++  // verify sorted column output is consistent
++  auto c1Vector = result->childAt(0);
++  auto* c1FlatVector = c1Vector->asFlatVector<int64_t>();
++  for (int i = 1; i < result->size(); i++) {
++    EXPECT_LE(c1FlatVector->valueAt(i - 1), c1FlatVector->valueAt(i));
++  }
++}
++
++TEST_F(SortBufferMergePathTest, noInput) {
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kOrderByMergePathParallelism, "4"}};
++  auto queryConfig = core::QueryConfig(configs);
++  auto spillDirectory = exec::test::TempDirectoryPath::create();
++  auto spillConfig = common::SpillConfig(
++      [&]() -> const std::string& { return spillDirectory->path; },
++      [&](uint64_t) {},
++      "0.0.0",
++      1000,
++      false,
++      0,
++      executor_.get(),
++      5,
++      10,
++      0,
++      0,
++      0,
++      0,
++      0,
++      100, //  testSpillPct
++      "none");
++  auto type = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
++  std::vector<CompareFlags> sortCompareFlags = {
++      {true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}};
++  std::vector<column_index_t> sortIndx = {0};
++  {
++    auto sortBuffer = std::make_unique<SortBufferMergePath>(
++        type,
++        sortIndx,
++        sortCompareFlags,
++        pool_.get(),
++        &nonReclaimableSection_,
++        &queryConfig,
++        nullptr,
++        nullptr,
++        executor_);
++    sortBuffer->noMoreInput();
++    auto result = sortBuffer->getOutput(1024);
++    ASSERT_EQ(result, nullptr);
++    ASSERT_EQ(sortBuffer->numInputRows(), 0);
++    ASSERT_EQ(sortBuffer->numOutputRows(), 0);
++  }
++  // case 2, empty vector inputs
++  {
++    auto sortBuffer = std::make_unique<SortBufferMergePath>(
++        type,
++        sortIndx,
++        sortCompareFlags,
++        pool_.get(),
++        &nonReclaimableSection_,
++        &queryConfig,
++        nullptr,
++        nullptr,
++        executor_);
++    auto input = BaseVector::create(inputType_, 0, pool_.get());
++    sortBuffer->addInput(input);
++    sortBuffer->noMoreInput();
++    auto result = sortBuffer->getOutput(1024);
++    ASSERT_EQ(result, nullptr);
++    ASSERT_EQ(sortBuffer->numInputRows(), 0);
++    ASSERT_EQ(sortBuffer->numOutputRows(), 0);
++  }
++
++  // case 3, multiple empty vector inputs
++  {
++    auto sortBuffer = std::make_unique<SortBufferMergePath>(
++        type,
++        sortIndx,
++        sortCompareFlags,
++        pool_.get(),
++        &nonReclaimableSection_,
++        &queryConfig,
++        nullptr,
++        nullptr,
++        executor_);
++    auto input = BaseVector::create(inputType_, 0, pool_.get());
++    sortBuffer->addInput(input);
++    sortBuffer->addInput(input);
++    sortBuffer->addInput(input);
++    sortBuffer->noMoreInput();
++    auto result = sortBuffer->getOutput(1024);
++    ASSERT_EQ(result, nullptr);
++    ASSERT_EQ(sortBuffer->numInputRows(), 0);
++    ASSERT_EQ(sortBuffer->numOutputRows(), 0);
++  }
++}
++
++// Tests sorting of UTF-8 strings with varying lengths, emojis, and Chinese
++// characters
++TEST_F(SortBufferMergePathTest, utf8StringSortingTest) {
++  // Create test strings with varying lengths (1-50), emojis, and Chinese
++  // characters
++  std::vector<std::string> testStringPool = {
++      "a", // 1 char
++      "你好", // Chinese characters (2 characters, 6 bytes)
++      "🚀", // Emoji (4 bytes)
++      "abcdefghijklmnopqrstuvwxyz", // 26 chars
++      "测试字符串", // Chinese (5 characters, 15 bytes)
++      "hello world", // 11 chars
++      "1234567890", // 10 chars
++      "😀😃😄😁😆", // Multiple emojis
++      "This is a longer string with mixed content: 测试123!@#🚀",
++      std::string(50, 'x'), // 50 chars
++      "short",
++      "中文字符与emoji的混合测试🚀🚗🚲🏠",
++      "A", // Capital letter
++      "z", // Lowercase letter
++      "1", // Number
++      "9"};
++
++  // Create 8192 test strings by randomly selecting from the pool
++  constexpr size_t kNumStrings = 8192;
++  std::vector<std::string> testStrings;
++  testStrings.reserve(kNumStrings);
++  std::random_device rd;
++  std::mt19937 g(rd());
++  std::uniform_int_distribution<> distrib(0, testStringPool.size() - 1);
++
++  for (size_t i = 0; i < kNumStrings; ++i) {
++    testStrings.push_back(testStringPool[distrib(g)]);
++  }
++
++  // Shuffle the strings to ensure they're not already sorted
++  std::shuffle(testStrings.begin(), testStrings.end(), g);
++
++  // Create expected sorted results using std::sort
++  std::vector<std::string> expectedSorted = testStrings;
++  std::sort(expectedSorted.begin(), expectedSorted.end());
++
++  // Configure the sort buffer to sort by the varchar column (c5)
++  sortColumnIndices_ = {5};
++  std::unordered_map<std::string, std::string> configs = {
++      {core::QueryConfig::kJitLevel, "0"}};
++  auto queryConfig = core::QueryConfig({configs});
++
++  // Create sort buffer with ascending sort
++  std::vector<CompareFlags> sortCompareFlags = {
++      {true, true, false, CompareFlags::NullHandlingMode::kNullAsValue}};
++  auto sortBuffer = std::make_unique<SortBufferMergePath>(
++      inputType_,
++      sortColumnIndices_,
++      sortCompareFlags,
++      pool_.get(),
++      &nonReclaimableSection_,
++      &queryConfig,
++      nullptr,
++      nullptr,
++      executor_);
++
++  // Add each test string as a separate row vector
++  for (const auto& testStr : testStrings) {
++    RowVectorPtr rowVector = makeRowVector(
++        {makeFlatVector<int64_t>(std::vector<int64_t>({0})),
++         makeFlatVector<int32_t>(std::vector<int32_t>({0})),
++         makeFlatVector<int16_t>(std::vector<int16_t>({0})),
++         makeFlatVector<float>(std::vector<float>({0})),
++         makeFlatVector<double>(std::vector<double>({0})),
++         makeFlatVector<std::string>(std::vector<std::string>({testStr}))});
++    sortBuffer->addInput(rowVector);
++  }
++
++  // Signal no more input
++  sortBuffer->noMoreInput();
++
++  // Collect the output
++  VectorPtr baseOut = BaseVector::create(inputType_, 0, pool_.get());
++  auto output = baseOut->as<RowVector>();
++  while (auto out = sortBuffer->getOutput(10000)) {
++    output->append(out.get());
++  }
++
++  // Verify the output size matches the input size
++  ASSERT_EQ(output->size(), testStrings.size());
++
++  // Convert the output to a std::vector<std::string>
++  std::vector<std::string> actualSorted;
++  actualSorted.reserve(output->size());
++  auto stringVector = output->childAt(5)->asFlatVector<StringView>();
++  for (int i = 0; i < output->size(); ++i) {
++    actualSorted.push_back(stringVector->valueAt(i).str());
++  }
++
++  // Verify the sorted order matches the expected order
++  ASSERT_EQ(actualSorted.size(), expectedSorted.size());
++  for (size_t i = 0; i < actualSorted.size(); ++i) {
++    ASSERT_EQ(actualSorted[i], expectedSorted[i])
++        << "Strings differ at index " << i << ": "
++        << "expected '" << expectedSorted[i] << "', "
++        << "got '" << actualSorted[i] << "'";
++  }
++}
++} // namespace bytedance::bolt::functions::test

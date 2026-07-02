@@ -32,9 +32,9 @@
 
 #include "bolt/exec/ContainerRowSerde.h"
 #include "bolt/exec/HybridSorter.h"
+#include "bolt/exec/ISortBuffer.h"
 #include "bolt/exec/Operator.h"
 #include "bolt/exec/RowContainer.h"
-#include "bolt/exec/SortBuffer.h"
 #include "bolt/exec/Spiller.h"
 namespace bytedance::bolt::exec {
 
@@ -88,8 +88,9 @@ class OrderBy : public Operator {
   void recordSpillStats();
   void recordSpillReadStats();
   void recordSortStats();
+  void recordParallelSortStats();
 
-  std::unique_ptr<SortBuffer> sortBuffer_;
+  std::unique_ptr<ISortBuffer> sortBuffer_;
   bool finished_ = false;
   vector_size_t maxOutputRows_;
 };

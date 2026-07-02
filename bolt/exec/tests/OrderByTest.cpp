@@ -79,6 +79,17 @@ common::SpillStats spilledStats(const exec::Task& task) {
   return spilledStats;
 }
 
+void assertParallelSortBufferUsed(
+    const std::shared_ptr<Task>& task,
+    const core::PlanNodeId& orderById) {
+  const auto taskStats = exec::toPlanStats(task->taskStats());
+  const auto& planStats = taskStats.at(orderById);
+  const auto metric = planStats.customStats.find("parallelSortBufferUsed");
+  ASSERT_NE(metric, planStats.customStats.end());
+  EXPECT_GT(metric->second.sum, 0);
+  EXPECT_GT(metric->second.count, 0);
+}
+
 void abortPool(memory::MemoryPool* pool) {
   try {
     BOLT_FAIL("Manual MemoryPool Abortion");
@@ -127,6 +138,66 @@ class OrderByTest : public OperatorTestBase, public WithGPUParamInterface<> {
       bolt::cudf::test::CudfResource::getInstance().finalize();
     }
 #endif
+  }
+
+  void assertParallelOrderBy(
+      const std::vector<RowVectorPtr>& vectors,
+      const std::vector<std::string>& orderByKeys,
+      const std::string& duckDbSql,
+      const std::vector<uint32_t>& sortingKeys,
+      bool spill,
+      uint64_t parallelMergeTargetRows = 3) {
+    createDuckDbTable(vectors);
+
+    core::PlanNodeId orderById;
+    auto plan = PlanBuilder()
+                    .values(vectors)
+                    .orderBy(orderByKeys, false)
+                    .capturePlanNodeId(orderById)
+                    .planNode();
+
+    auto queryCtx = core::QueryCtx::create(executor_.get());
+    queryCtx->testingOverrideConfigUnsafe({
+        {core::QueryConfig::kOrderByParallelSortEnabled, "true"},
+        {core::QueryConfig::kOrderByParallelMergeTargetRows,
+         folly::to<std::string>(parallelMergeTargetRows)},
+        {core::QueryConfig::kOrderByParallelMergeLookaheadTasks, "2"},
+        {core::QueryConfig::kPreferredOutputBatchRows, "1"},
+        {core::QueryConfig::kMaxOutputBatchRows, "17"},
+        {core::QueryConfig::kSpillEnabled, spill ? "true" : "false"},
+        {core::QueryConfig::kOrderBySpillEnabled, spill ? "true" : "false"},
+        {core::QueryConfig::kJitLevel, "-1"},
+    });
+
+    CursorParameters params;
+    params.planNode = plan;
+    params.queryCtx = queryCtx;
+
+    if (spill) {
+      auto spillDirectory = exec::test::TempDirectoryPath::create();
+      TestScopedSpillInjection scopedSpillInjection(100);
+      params.spillDirectory = spillDirectory->path;
+      auto task = assertQueryOrdered(params, duckDbSql, sortingKeys);
+      assertParallelSortBufferUsed(task, orderById);
+
+      auto taskStats = exec::toPlanStats(task->taskStats());
+      const auto& planStats = taskStats.at(orderById);
+      ASSERT_GT(planStats.spilledBytes, 0);
+      ASSERT_GT(planStats.spilledRows, 0);
+      ASSERT_GT(planStats.spilledInputBytes, 0);
+      ASSERT_EQ(planStats.spilledPartitions, 1);
+      ASSERT_GT(planStats.spilledFiles, 0);
+      OperatorTestBase::deleteTaskAndCheckSpillDirectory(task);
+    } else {
+      auto task = assertQueryOrdered(params, duckDbSql, sortingKeys);
+      assertParallelSortBufferUsed(task, orderById);
+
+      auto taskStats = exec::toPlanStats(task->taskStats());
+      const auto& planStats = taskStats.at(orderById);
+      ASSERT_EQ(planStats.spilledBytes, 0);
+      ASSERT_EQ(planStats.spilledRows, 0);
+      ASSERT_EQ(planStats.spilledInputBytes, 0);
+    }
   }
 
   void testSingleKey(
@@ -407,6 +478,311 @@ TEST_P(OrderByTest, singleKey) {
              .capturePlanNodeId(orderById)
              .planNode();
   runTest(plan, orderById, "SELECT * FROM tmp ORDER BY c0 NULLS FIRST", {0});
+}
+
+TEST_P(OrderByTest, parallelSortEnabledInMemory) {
+  if (GetParam().useGPU) {
+    return;
+  }
+
+  std::vector<RowVectorPtr> vectors = {
+      makeRowVector(
+          {makeFlatVector<int32_t>({6, 2, 4}),
+           makeFlatVector<int32_t>({60, 20, 40}),
+           makeFlatVector<std::string>({"six", "two", "four"})}),
+      makeRowVector(
+          {makeFlatVector<int32_t>({5, 1, 3}),
+           makeFlatVector<int32_t>({50, 10, 30}),
+           makeFlatVector<std::string>({"five", "one", "three"})})};
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId orderById;
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .orderBy({"c0 ASC NULLS LAST"}, false)
+                  .capturePlanNodeId(orderById)
+                  .planNode();
+  auto queryCtx = core::QueryCtx::create(executor_.get());
+  queryCtx->testingOverrideConfigUnsafe({
+      {core::QueryConfig::kOrderByParallelSortEnabled, "true"},
+      {core::QueryConfig::kSpillEnabled, "false"},
+  });
+  CursorParameters params;
+  params.planNode = plan;
+  params.queryCtx = queryCtx;
+  auto task = assertQueryOrdered(params, "SELECT * FROM tmp ORDER BY c0", {0});
+  assertParallelSortBufferUsed(task, orderById);
+}
+
+TEST_P(OrderByTest, parallelSortAndMergeEnabledInMemory) {
+  if (GetParam().useGPU) {
+    return;
+  }
+
+  std::vector<RowVectorPtr> vectors = {
+      makeRowVector(
+          {makeFlatVector<int32_t>({5, 1, 3}),
+           makeFlatVector<int32_t>({50, 10, 30}),
+           makeFlatVector<std::string>({"five", "one", "three"})}),
+      makeRowVector(
+          {makeFlatVector<int32_t>({2, 6, 4}),
+           makeFlatVector<int32_t>({20, 60, 40}),
+           makeFlatVector<std::string>({"two", "six", "four"})}),
+      makeRowVector(
+          {makeFlatVector<int32_t>({0, 7}),
+           makeFlatVector<int32_t>({0, 70}),
+           makeFlatVector<std::string>({"zero", "seven"})})};
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId orderById;
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .orderBy({"c0 ASC NULLS LAST"}, false)
+                  .capturePlanNodeId(orderById)
+                  .planNode();
+  auto queryCtx = core::QueryCtx::create(executor_.get());
+  queryCtx->testingOverrideConfigUnsafe({
+      {core::QueryConfig::kOrderByParallelSortEnabled, "true"},
+      {core::QueryConfig::kOrderByParallelMergeTargetRows, "3"},
+      {core::QueryConfig::kOrderByParallelMergeLookaheadTasks, "2"},
+      {core::QueryConfig::kPreferredOutputBatchRows, "1"},
+      {core::QueryConfig::kMaxOutputBatchRows, "2"},
+      {core::QueryConfig::kSpillEnabled, "false"},
+  });
+  CursorParameters params;
+  params.planNode = plan;
+  params.queryCtx = queryCtx;
+  auto task = assertQueryOrdered(params, "SELECT * FROM tmp ORDER BY c0", {0});
+  assertParallelSortBufferUsed(task, orderById);
+}
+
+TEST_P(OrderByTest, parallelSortAndMergeEnabledWithSpill) {
+  if (GetParam().useGPU) {
+    return;
+  }
+
+  const vector_size_t batchSize = 2'048;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 3; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             batchSize,
+             [batch](vector_size_t row) { return batchSize - row + batch; }),
+         makeFlatVector<int64_t>(
+             batchSize,
+             [batch](vector_size_t row) { return batch * batchSize + row; }),
+         makeFlatVector<std::string>(batchSize, [batch](vector_size_t row) {
+           return fmt::format("payload-{}-{}", batch, row);
+         })}));
+  }
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId orderById;
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .orderBy({"c0 ASC NULLS LAST"}, false)
+                  .capturePlanNodeId(orderById)
+                  .planNode();
+
+  auto spillDirectory = exec::test::TempDirectoryPath::create();
+  auto queryCtx = core::QueryCtx::create(executor_.get());
+  TestScopedSpillInjection scopedSpillInjection(100);
+  queryCtx->testingOverrideConfigUnsafe({
+      {core::QueryConfig::kSpillEnabled, "true"},
+      {core::QueryConfig::kOrderBySpillEnabled, "true"},
+      {core::QueryConfig::kOrderByParallelSortEnabled, "true"},
+      {core::QueryConfig::kOrderByParallelMergeTargetRows, "512"},
+      {core::QueryConfig::kOrderByParallelMergeLookaheadTasks, "2"},
+      {core::QueryConfig::kJitLevel, "-1"},
+  });
+
+  CursorParameters params;
+  params.planNode = plan;
+  params.queryCtx = queryCtx;
+  params.spillDirectory = spillDirectory->path;
+  auto task = assertQueryOrdered(params, "SELECT * FROM tmp ORDER BY c0", {0});
+  assertParallelSortBufferUsed(task, orderById);
+
+  auto taskStats = exec::toPlanStats(task->taskStats());
+  const auto& planStats = taskStats.at(orderById);
+  ASSERT_GT(planStats.spilledBytes, 0);
+  ASSERT_GT(planStats.spilledRows, 0);
+  ASSERT_GT(planStats.spilledInputBytes, 0);
+  ASSERT_EQ(planStats.spilledPartitions, 1);
+  ASSERT_GT(planStats.spilledFiles, 0);
+  OperatorTestBase::deleteTaskAndCheckSpillDirectory(task);
+}
+
+TEST_P(OrderByTest, parallelSortInMemoryDuplicateHeavyMultipleKeys) {
+  if (GetParam().useGPU) {
+    return;
+  }
+
+  const vector_size_t batchSize = 256;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 4; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             batchSize, [](vector_size_t row) { return row % 8; }),
+         makeFlatVector<int64_t>(
+             batchSize,
+             [batch](vector_size_t row) { return batch * batchSize + row; }),
+         makeFlatVector<std::string>(batchSize, [batch](vector_size_t row) {
+           return fmt::format("dup-{}-{}", batch, row);
+         })}));
+  }
+
+  assertParallelOrderBy(
+      vectors,
+      {"c0 ASC NULLS LAST", "c1 ASC NULLS LAST"},
+      "SELECT * FROM tmp ORDER BY c0 NULLS LAST, c1 NULLS LAST",
+      {0, 1},
+      false,
+      31);
+}
+
+TEST_P(OrderByTest, parallelSortInMemoryNullsDescending) {
+  if (GetParam().useGPU) {
+    return;
+  }
+
+  const vector_size_t batchSize = 333;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 3; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             batchSize,
+             [batch](vector_size_t row) { return row % 23 - batch; },
+             nullEvery(7)),
+         makeFlatVector<int64_t>(
+             batchSize,
+             [batch](vector_size_t row) { return batch * batchSize + row; }),
+         makeFlatVector<std::string>(batchSize, [batch](vector_size_t row) {
+           return fmt::format("null-desc-{}-{}", batch, row);
+         })}));
+  }
+
+  assertParallelOrderBy(
+      vectors,
+      {"c0 DESC NULLS FIRST", "c1 ASC NULLS LAST"},
+      "SELECT * FROM tmp ORDER BY c0 DESC NULLS FIRST, c1 NULLS LAST",
+      {0, 1},
+      false,
+      29);
+}
+
+TEST_P(OrderByTest, parallelSortInMemoryStringKey) {
+  if (GetParam().useGPU) {
+    return;
+  }
+
+  const vector_size_t batchSize = 257;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 3; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             batchSize,
+             [batch](vector_size_t row) { return batch * batchSize + row; }),
+         makeFlatVector<int64_t>(
+             batchSize, [](vector_size_t row) { return row % 11; }),
+         makeFlatVector<std::string>(batchSize, [batch](vector_size_t row) {
+           return fmt::format("key-{:03d}-{:03d}", row % 17, 2 - batch);
+         })}));
+  }
+
+  assertParallelOrderBy(
+      vectors,
+      {"c2 ASC NULLS LAST", "c1 DESC NULLS LAST", "c0 ASC NULLS LAST"},
+      "SELECT * FROM tmp ORDER BY c2 NULLS LAST, c1 DESC NULLS LAST, c0 NULLS LAST",
+      {2, 1, 0},
+      false,
+      23);
+}
+
+TEST_P(OrderByTest, parallelSortSpillDuplicateHeavyMultipleKeys) {
+  if (GetParam().useGPU) {
+    return;
+  }
+
+  const vector_size_t batchSize = 512;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 5; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             batchSize, [](vector_size_t row) { return row % 5; }),
+         makeFlatVector<int64_t>(
+             batchSize,
+             [batch](vector_size_t row) { return batch * batchSize + row; }),
+         makeFlatVector<std::string>(batchSize, [batch](vector_size_t row) {
+           return fmt::format("spill-dup-{}-{}", batch, row);
+         })}));
+  }
+
+  assertParallelOrderBy(
+      vectors,
+      {"c0 ASC NULLS LAST", "c1 ASC NULLS LAST"},
+      "SELECT * FROM tmp ORDER BY c0 NULLS LAST, c1 NULLS LAST",
+      {0, 1},
+      true,
+      127);
+}
+
+TEST_P(OrderByTest, parallelSortSpillNullsDescending) {
+  if (GetParam().useGPU) {
+    return;
+  }
+
+  const vector_size_t batchSize = 513;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 4; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             batchSize,
+             [batch](vector_size_t row) { return 1'000 - row + batch; },
+             nullEvery(9, 3)),
+         makeFlatVector<int64_t>(
+             batchSize,
+             [batch](vector_size_t row) { return batch * batchSize + row; }),
+         makeFlatVector<std::string>(batchSize, [batch](vector_size_t row) {
+           return fmt::format("spill-null-desc-{}-{}", batch, row);
+         })}));
+  }
+
+  assertParallelOrderBy(
+      vectors,
+      {"c0 DESC NULLS FIRST", "c1 ASC NULLS LAST"},
+      "SELECT * FROM tmp ORDER BY c0 DESC NULLS FIRST, c1 NULLS LAST",
+      {0, 1},
+      true,
+      113);
+}
+
+TEST_P(OrderByTest, parallelSortSpillStringKeySmallMergeTasks) {
+  if (GetParam().useGPU) {
+    return;
+  }
+
+  const vector_size_t batchSize = 384;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 6; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             batchSize,
+             [batch](vector_size_t row) { return batch * batchSize + row; }),
+         makeFlatVector<int64_t>(
+             batchSize, [](vector_size_t row) { return row % 19; }),
+         makeFlatVector<std::string>(batchSize, [batch](vector_size_t row) {
+           return fmt::format("spill-key-{:03d}-{:03d}", row % 31, batch);
+         })}));
+  }
+
+  assertParallelOrderBy(
+      vectors,
+      {"c2 ASC NULLS LAST", "c1 ASC NULLS LAST", "c0 DESC NULLS LAST"},
+      "SELECT * FROM tmp ORDER BY c2 NULLS LAST, c1 NULLS LAST, c0 DESC NULLS LAST",
+      {2, 1, 0},
+      true,
+      64);
 }
 
 TEST_P(OrderByTest, multipleKeys) {

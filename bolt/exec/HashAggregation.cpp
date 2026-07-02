@@ -163,7 +163,9 @@ void HashAggregation::initialize() {
         operatorCtx_->operatorId(), rowbasedSpillMode);
   }
 
-  addRuntimeStat("isDistinctAggregation", RuntimeCounter(isDistinct_));
+  addRuntimeStat(
+      "isDistinctAggregation",
+      RuntimeCounter(static_cast<int64_t>(isDistinct_)));
 
   for (auto i = 0; i < hashers.size(); ++i) {
     identityProjections_.emplace_back(hashers[i]->channel(), i);

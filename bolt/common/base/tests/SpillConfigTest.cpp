@@ -184,6 +184,7 @@ SpillConfig makeFullConfig() {
   cfg.testSpillPct = 5;
   cfg.compressionKind = CompressionKind_ZSTD;
   cfg.fileCreateConfig = R"({"option":"value"})";
+  cfg.indexedSpillEnabled = true;
   cfg.rowBasedSpillMode = RowBasedSpillMode::RAW;
   cfg.singlePartitionSerdeKind = "Arrow";
   cfg.spillPartitionsAdaptiveThreshold = 64;
@@ -209,6 +210,7 @@ void assertFieldsEqual(const SpillConfig& e, const SpillConfig& a) {
   EXPECT_EQ(e.testSpillPct, a.testSpillPct);
   EXPECT_EQ(e.compressionKind, a.compressionKind);
   EXPECT_EQ(e.fileCreateConfig, a.fileCreateConfig);
+  EXPECT_EQ(e.indexedSpillEnabled, a.indexedSpillEnabled);
   EXPECT_EQ(e.rowBasedSpillMode, a.rowBasedSpillMode);
   EXPECT_EQ(e.singlePartitionSerdeKind, a.singlePartitionSerdeKind);
   EXPECT_EQ(
